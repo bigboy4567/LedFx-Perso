@@ -1,0 +1,212 @@
+import logging
+from typing import ClassVar, Literal
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageEnhance
+from pydantic import Field
+
+from ledfx.configuration.fields import CoercedInt
+from ledfx.configuration.plugin import TypedConfig
+from ledfx.effects import Effect
+from ledfx.effects.audio import AudioReactiveEffect
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@Effect.no_registration
+class Twod(AudioReactiveEffect):
+    # hiding dump by default, a dev can turn it on explicitily via removal
+    HIDDEN_KEYS: ClassVar[list[str]] = ["mirror", "flip", "blur", "dump"]
+    ADVANCED_KEYS = AudioReactiveEffect.ADVANCED_KEYS + [
+        "dump",
+        "test",
+        "flip_horizontal",
+        "flip_vertical",
+        "background_mode",
+    ]
+
+    class Config(AudioReactiveEffect.Config):
+        flip_horizontal: bool = Field(False, description="flip the image horizontally")
+        flip_vertical: bool = Field(False, description="flip the image vertically")
+        rotate: CoercedInt = Field(0, description="90 Degree rotations", ge=0, le=3)
+        test: bool = Field(False, description="ignore audio input")
+        dump: bool = Field(False, description="dump image")
+        background_mode: Literal["additive", "overwrite"] = Field("additive")
+
+    config = TypedConfig(Config)
+
+    def __init__(self, ledfx, config):
+        super().__init__(ledfx, config)
+        self.last_dump = self.config.dump
+
+    def on_activate(self, pixel_count):
+        self.current_pixel = 0
+        self.last_cycle_time = 20
+        self.bar = 0
+        self.t_height = max(1, self._virtual.config.rows)
+        self.t_width = max(1, self.pixel_count // self.t_height)
+        self.init = True
+
+    def config_updated(self, config):
+        self.test = self.config.test
+        self.background_mode = self.config.background_mode
+
+        # rotation and mirror has to be dealt with in the do_once so that the virtual is known
+        self.init = True
+
+    def set_init(self):
+        """
+        Kick the init flag to True so that an effect can reconfigure itself
+        when running in its own context if it has a dependancy on the virtual
+        setting this flag keeps things atomic and ensures that the effect is not
+        reconfigured while it is being rendered or otherwise in use
+        """
+
+        self.init = True
+
+    def do_once(self):
+        # defer things that can't be done when pixel_count is not known
+        # so therefore cannot be addressed in config_updated
+        # also triggered by config change in parent virtual
+        # row or rotate change
+
+        # We will render in to native image size of the matrix on rotation
+        # This saves us from having to do ugly resizing and aliasing effects
+        # as well as a small performance boost
+        # we need to accout for swapping vertical and horizotal for 90 / 270
+
+        # composite the virtual rotate with the effect level rotate
+        virtual_rotate = self._virtual.config.rotate if self._virtual else 0
+        self.rotate = (self.config.rotate + virtual_rotate) % 4
+
+        self.rotate_t = 0
+        self.flip2d = self.config.flip_vertical
+        self.mirror2d = self.config.flip_horizontal
+
+        if self.rotate == 1:
+            self.rotate_t = Image.Transpose.ROTATE_90
+            self.flip2d, self.mirror2d = self.mirror2d, self.flip2d
+        if self.rotate == 2:
+            self.rotate_t = Image.Transpose.ROTATE_180
+        if self.rotate == 3:
+            self.rotate_t = Image.Transpose.ROTATE_270
+            self.flip2d, self.mirror2d = self.mirror2d, self.flip2d
+
+        self.t_height = max(1, self._virtual.config.rows)
+        self.t_width = max(1, self.pixel_count // self.t_height)
+
+        if self.rotate == 1 or self.rotate == 3:
+            # swap width and height for render
+            self.r_width = max(1, self.t_height)
+            self.r_height = max(1, self.t_width)
+        else:
+            self.r_width = max(1, self.t_width)
+            self.r_height = max(1, self.t_height)
+
+        self.init = False
+
+    def image_to_pixels(self):
+        # image should be the right size to map in, at this point
+        if self.flip2d:
+            old_matrix = self.matrix
+            self.matrix = self.matrix.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+            old_matrix.close()
+        if self.mirror2d:
+            old_matrix = self.matrix
+            self.matrix = self.matrix.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+            old_matrix.close()
+        if self.rotate_t != 0:
+            old_matrix = self.matrix
+            self.matrix = self.matrix.transpose(self.rotate_t)
+            old_matrix.close()
+        if self.matrix.size != (self.t_width, self.t_height):
+            _LOGGER.error(
+                "Matrix is wrong size %s vs r %s vs t %s",
+                self.matrix.size,
+                (self.r_width, self.r_height),
+                (self.t_width, self.t_height),
+            )
+
+        rgb_array = np.frombuffer(self.matrix.tobytes(), dtype=np.uint8)
+        rgb_array = rgb_array.astype(np.float32)
+        rgb_array = rgb_array.reshape(int(rgb_array.shape[0] / 3), 3)
+
+        copy_length = min(self.pixels.shape[0], rgb_array.shape[0])
+        self.pixels[:copy_length, :] = rgb_array[:copy_length, :]
+
+    def try_dump(self):
+        if self.last_dump != self.config.dump:
+            self.last_dump = self.config.dump
+            # show image on screen
+            self.matrix.show()
+            _LOGGER.info(
+                "dump %sx%s R: %s F: %s M: %s",
+                self.t_width,
+                self.t_height,
+                self.rotate_t,
+                self.flip2d,
+                self.mirror2d,
+            )
+
+    def draw_test(self, rgb_draw):
+        width, height = rgb_draw._image.size
+        rgb_draw.rectangle(
+            [(0, 0), (width - 1, height - 1)],
+            fill=None,
+            outline="white",
+        )
+        mid_w, mid_h = int(width / 2), int(height / 2)
+        rgb_draw.line([(0, 0), (mid_w, mid_h)], fill="red", width=1)
+        rgb_draw.line(
+            [(width - 1, 0), (mid_w - 1, mid_h)],
+            fill="blue",
+            width=1,
+        )
+        rgb_draw.line(
+            [(0, height - 1), (mid_w - 1, mid_h)],
+            fill="green",
+            width=1,
+        )
+        rgb_draw.line(
+            [(width - 1, height - 1), (mid_w, mid_h)],
+            fill="white",
+            width=1,
+        )
+
+    def get_matrix(self, brightness=True):
+        with self.lock:
+            result = self.matrix.copy()
+            if brightness and self.brightness != 1.0:
+                result = ImageEnhance.Brightness(result).enhance(self.brightness)
+            return result
+
+    def draw(self):
+        # this should be implemented in the child class
+        # should render into self.matrix at the final size
+        # for display using self.m_draw
+        pass
+
+    def render(self):
+        if self.init:
+            self.do_once()
+
+        # Close old matrix before creating new one to prevent memory leak
+        if hasattr(self, "matrix") and self.matrix:
+            try:
+                self.matrix.close()
+            except Exception:  # noqa: BLE001, S110
+                pass
+
+        if self.bg_color_use and self.background_mode == "overwrite":
+            self.matrix = Image.new(
+                "RGB", (self.r_width, self.r_height), self._bg_color_pil
+            )
+        else:
+            self.matrix = Image.new("RGB", (self.r_width, self.r_height))
+
+        self.m_draw = ImageDraw.Draw(self.matrix)
+
+        self.draw()
+        self.image_to_pixels()
+
+        self.try_dump()

@@ -1,0 +1,247 @@
+import logging
+from json import JSONDecodeError
+from typing import Annotated
+
+from aiohttp import web
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+
+from ledfx.api import RestEndpoint
+from ledfx.api.v1_compat import v1_color
+from ledfx.configuration.fields import VirtualIdStr
+from ledfx.configuration.models import Highlight, OneshotParams
+from ledfx.effects import DummyEffect
+from ledfx.errors import Conflict, Invalid, ensure_writable
+
+_LOGGER = logging.getLogger(__name__)
+
+TOOLS = ["force_color", "calibration", "highlight", "oneshot", "copy"]
+
+
+class OneshotRequest(BaseModel):
+    """POST body for the oneshot tool. Times are in milliseconds."""
+
+    # An infinite fade never expires and turns the pixels to NaN.
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    # v1-compat: a colour may be an [r, g, b] list.
+    color: Annotated[str | list[int], AfterValidator(v1_color)] = "white"
+    ramp: float = Field(0, ge=0)
+    hold: float = Field(0, ge=0)
+    fade: float = Field(0, ge=0)
+    brightness: float = 1
+
+    def params(self) -> OneshotParams:
+        return OneshotParams(
+            color=str(self.color),  # a str once validated
+            ramp_ms=self.ramp,
+            hold_ms=self.hold,
+            fade_ms=self.fade,
+            # v1-compat: values outside 0-1 are clamped, as they always were;
+            # the manager refuses them.
+            brightness=min(1.0, max(0.0, self.brightness)),
+        )
+
+
+async def refuse_post_tool(
+    endpoint: RestEndpoint, tool: object, tools: list[str]
+) -> web.Response | None:
+    """The failure response for a POST tool other than oneshot, else None."""
+    if tool is None:
+        return await endpoint.invalid_request(
+            'Required attribute "tool" was not provided'
+        )
+    if tool not in tools:
+        return await endpoint.invalid_request(f"Tool {tool} is not in {tools}")
+    if tool != "oneshot":
+        return await endpoint.invalid_request(
+            f"POST only runs the oneshot tool; use PUT for {tool}"
+        )
+    return None
+
+
+class VirtualsToolsEndpoint(RestEndpoint):
+    """api for individual virtual tools"""
+
+    ENDPOINT_PATH = "/api/virtuals_tools/{virtual_id}"
+
+    async def get(self, virtual_id: str) -> web.Response:
+        """
+        Get the tools specified for a virtual ID.
+
+        Parameters:
+        - virtual_id: The ID of the virtual.
+
+        Returns:
+        - web.Response: The response containing the tools for the virtual ID.
+        """
+        return await self.request_success("info", f"Available tools: {TOOLS}")
+
+    async def post(self, virtual_id: str, request: web.Request) -> web.Response:
+        """
+        Uses the specified virtual tool on the virtual.
+
+        Args:
+            virtual_id (str): The ID of the virtual.
+            request (web.Request): The request object containing the `tool` to use.
+
+        Returns:
+            web.Response: The HTTP response object.
+        """
+        if self._ledfx.virtuals.get(virtual_id) is None:
+            return await self.invalid_request(f"Virtual with ID {virtual_id} not found")
+
+        try:
+            data = await request.json()
+        except JSONDecodeError:
+            return await self.json_decode_error()
+
+        tool = data.get("tool")
+        if refused := await refuse_post_tool(self, tool, TOOLS):
+            return refused
+
+        oneshot = OneshotRequest.model_validate(data)
+        try:
+            self._ledfx.virtuals.oneshot(VirtualIdStr(virtual_id), oneshot.params())
+        except Conflict:
+            return await self.invalid_request("oneshot failed")
+
+        response = {"status": "success", "tool": tool}
+        return await self.bare_request_success(response)
+
+    async def put(self, virtual_id: str, request: web.Request) -> web.Response:
+        """
+        Uses the specified virtual tool on the virtual.
+
+        Args:
+            virtual_id (str): The ID of the virtual.
+            request (web.Request): The request object containing the `tool` to use.
+
+        Returns:
+            web.Response: The HTTP response object.
+        """
+        if self._ledfx.virtuals.get(virtual_id) is None:
+            return await self.invalid_request(f"Virtual with ID {virtual_id} not found")
+
+        try:
+            data = await request.json()
+        except JSONDecodeError:
+            return await self.json_decode_error()
+
+        tool = data.get("tool")
+        virtuals = self._ledfx.virtuals
+        vid = VirtualIdStr(virtual_id)
+
+        if tool is None:
+            return await self.invalid_request(
+                'Required attribute "tool" was not provided'
+            )
+
+        if tool not in TOOLS:
+            return await self.invalid_request(f"Tool {tool} is not in {TOOLS}")
+
+        if tool == "force_color":
+            color = data.get("color")
+            if color is None:
+                return await self.invalid_request(
+                    "Required attribute for force_color, color was not provided"
+                )
+
+            try:
+                # v1-compat: a colour may be an [r, g, b] list.
+                virtuals.force_color(vid, v1_color(color))
+            except (ValueError, Invalid) as e:
+                return await self.invalid_request(str(e))
+
+        if tool == "calibration":
+            mode = data.get("mode")
+            if mode in ("on", "off"):
+                virtuals.set_calibration(vid, mode == "on")
+            else:
+                return await self.invalid_request(
+                    "Required attribute for calibration, mode:on or mode:off expected"
+                )
+
+        if tool == "highlight":
+            state = data.get("state", True)
+            device = data.get("device")
+            start = data.get("start", -1)
+            end = data.get("stop", -1)
+            flip = data.get("flip", False)
+
+            # test if start and end are integers
+            if type(start) is not int or type(end) is not int:
+                return await self.invalid_request("start and end must be integers")
+
+            highlight = Highlight(device, start, end, flip) if state else None
+            virtual = virtuals.get_or_raise(vid)
+            if not virtual.calibrating:
+                # v1-compat: v1 names calibration before a bad device or range
+                # (the manager checks its input first), and refuses highlight
+                # off outside calibration (the manager treats it as idempotent).
+                return await self.invalid_request(
+                    f"highlight error: Cannot set highlight when {virtual.name} is not in calibration mode"
+                )
+            # v1-compat: v1 answered 500 for a missing or non-string device.
+            if state and not isinstance(device, str):
+                return await self.invalid_request(
+                    f"highlight error: Device {device} not found"
+                )
+            unlit = state and (start < 0 or start > end)
+            if unlit:
+                # v1-compat: v1 answered success for an omitted (-1), negative
+                # or reversed range and lit nothing; the manager refuses them.
+                # Run its device and past-the-end checks on the nearest valid
+                # range, then clear what that lit.
+                nearest = max(start, end, 0)
+                highlight = Highlight(device, nearest, nearest, flip)
+            try:
+                virtuals.set_highlight(vid, highlight)
+            except Invalid as err:
+                # v1-compat: v1's own wording for what the manager reports by
+                # field (body.device_id, or body.start / body.end).
+                if err.loc[-1] == "device_id":
+                    reason = f"Device {device.lower()} not found"
+                else:
+                    pixels = self._ledfx.devices.get(device.lower()).pixel_count
+                    reason = f"start and end must be less than {pixels}"
+                return await self.invalid_request(f"highlight error: {reason}")
+            if unlit:
+                virtuals.set_highlight(vid, None)
+
+        # Disable the virtual's oneshot Flashes
+        if tool == "oneshot" and not virtuals.clear_oneshots(vid):
+            return await self.invalid_request("oneshot was not found")
+
+        if tool == "copy":
+            # copy the config of the specified virtual instance to all virtuals listed in the target payload
+            target = data.get("target")
+            # test if target is none or not a list
+
+            if target is None:
+                return await self.invalid_request(
+                    "Required attribute for copy, target was not provided"
+                )
+            if type(target) is not list:
+                return await self.invalid_request(
+                    "Required attribute for copy, target must be a list"
+                )
+            # v1-compat: v1 skips unknown targets and lumps "every target
+            # refused" with "none known"; the manager raises NotFound / Conflict.
+            # It also answers safe mode, then a source with no effect, before
+            # it looks at the targets, so those checks run first here.
+            ensure_writable(self._ledfx)
+            source = virtuals.get_or_raise(vid).active_effect
+            if source is None or isinstance(source, DummyEffect):
+                return await self.invalid_request(
+                    "Virtual copy failed, no active effect on source virtual"
+                )
+            known = [VirtualIdStr(t) for t in target if virtuals.get(t) is not None]
+            try:
+                virtuals.copy_effect(vid, known)
+            except Conflict:
+                return await self.invalid_request(
+                    "Virtual copy failed, no valid targets"
+                )
+
+        response = {"status": "success", "tool": tool}
+        return await self.bare_request_success(response)

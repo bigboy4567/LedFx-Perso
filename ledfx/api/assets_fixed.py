@@ -1,0 +1,50 @@
+"""API endpoint for listing built-in assets from LEDFX_ASSETS_PATH."""
+
+import logging
+import os
+
+from aiohttp import web
+
+from ledfx.api import RestEndpoint
+from ledfx.assets import _list_assets_from_directory
+from ledfx.consts import LEDFX_ASSETS_PATH
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class AssetsFixedEndpoint(RestEndpoint):
+    """
+    REST API endpoint for listing built-in assets from LEDFX_ASSETS_PATH.
+
+    Provides metadata for GIFs and images bundled with LedFx installation,
+    allowing frontend to discover available built-in assets dynamically.
+    """
+
+    ENDPOINT_PATH = "/api/assets_fixed"
+
+    async def get(self) -> web.Response:
+        """
+        List all built-in assets from LEDFX_ASSETS_PATH/gifs with metadata.
+
+        Returns metadata for all images in the gifs directory and subdirectories,
+        including dimensions, format, and animation information.
+
+        Returns:
+            Bare JSON response with list of asset metadata objects,
+            each containing path, size, modified timestamp, dimensions, format,
+            frame count, and animation status, or error response if listing fails.
+        """
+        try:
+            gifs_root = os.path.join(LEDFX_ASSETS_PATH, "gifs")
+            # Store cache in config directory to avoid polluting installation directory
+            cache_dir = os.path.join(self._ledfx.config_dir, "cache")
+            assets = _list_assets_from_directory(
+                gifs_root, "built-in assets", cache_dir=cache_dir
+            )
+            return await self.bare_request_success({"assets": assets})
+
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.warning("Failed to list built-in assets: %s", e)
+            return await self.internal_error(
+                message=f"Failed to list built-in assets: {e}"
+            )

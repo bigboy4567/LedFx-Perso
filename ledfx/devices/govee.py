@@ -1,0 +1,171 @@
+import json
+import logging
+import socket
+import time
+
+from ledfx_senders.encoders import encode_govee
+from pydantic import Field
+
+from ledfx.configuration.fields import X_REQUIRED, Fps
+from ledfx.configuration.plugin import TypedConfig
+from ledfx.devices import NetworkedDevice
+from ledfx.devices.utils.socket_singleton import SocketSingleton
+from ledfx.utils import AVAILABLE_FPS
+
+_LOGGER = logging.getLogger(__name__)
+
+# this is very much a prototype implementation
+# no current known documentation on the protocol
+# use with caution.
+
+
+class Govee(NetworkedDevice):
+    """
+    Support for Govee devices with local API control
+    """
+
+    class Config(NetworkedDevice.Config):
+        ip_address: str = Field(
+            description="Hostname or IP address of the device",
+            json_schema_extra={X_REQUIRED: True},
+        )
+        pixel_count: int = Field(
+            1,
+            description="Number of segments (seen in app)",
+            ge=1,
+            json_schema_extra={X_REQUIRED: True},
+        )
+        refresh_rate: Fps = Field(
+            next(
+                (f for f in AVAILABLE_FPS if f >= 30),
+                list(AVAILABLE_FPS)[-1],
+            ),
+            description="Target rate that pixels are sent to the device",
+        )
+        ignore_status: bool = Field(
+            False,
+            description="Bypass check for device status check response on port 4003",
+        )
+        stretch_to_fit: bool = Field(
+            False,
+            description="Some archane setting to make the pixel pattern stretch to fit the device",
+        )
+
+    config = TypedConfig(Config)
+
+    def __init__(self, ledfx, config):
+        super().__init__(ledfx, config)
+        self._device_type = "Govee"
+        self.status = {}
+        self.port = 4003  # Control Port
+        self.multicast_group = "239.255.255.250"  # Multicast Address
+        self.send_response_port = 4001  # Send Scanning
+        self.recv_port = 4002  # Responses
+        self.udp_server = None
+
+    def send_udp(self, message, port=4003):
+        data = json.dumps(message).encode("utf-8")
+        try:
+            self.udp_server.sendto(data, (self.config.ip_address, port))
+        except Exception as e:  # noqa: BLE001
+            # we don't need this noise in sentry, and don't flood a standard log
+            _LOGGER.info("govee:send_udp:Error sending UDP message %s", e)
+
+    # Set Light Brightness
+    def set_brightness(self, value):
+        self.send_udp({"msg": {"cmd": "brightness", "data": {"value": value}}})
+
+    def send_devstatus_enquiry(self):
+        self.send_udp({"msg": {"cmd": "devStatus", "data": {}}})
+
+    def send_activate(self):
+        # BB 00 01 B1 01 0A
+        self.send_udp({"msg": {"cmd": "razer", "data": {"pt": "uwABsQEK"}}})
+
+    def send_deactivate(self):
+        # BB 00 01 B1 00 0B
+        self.send_udp({"msg": {"cmd": "razer", "data": {"pt": "uwABsQAL"}}})
+
+    def deactivate(self):
+        _LOGGER.info("Govee %s deactivate", self.name)
+        if self.udp_server is not None:
+            self.send_deactivate()
+            self.udp_server.close()
+            # A second deactivate must not release the shared socket again.
+            self.udp_server = None
+        super().deactivate()
+
+    def activate(self):
+        _LOGGER.info("Govee %s Activating UDP stream mode...", self.name)
+
+        try:
+            if self.config.ignore_status:
+                self.udp_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            else:
+                self.udp_server = SocketSingleton(recv_port=self.recv_port)
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.error(
+                "Error creating UDP socket, try ignore status device setting %s",
+                e,
+            )
+            self.set_offline()
+            return
+
+        if not self.config.ignore_status:
+            # enquiry to status is current used only to check if the device is responding adn set offline if not
+            # the response information is of little use
+            # example: {"msg":{"cmd":"devStatus","data":{"onOff":1,"brightness":100,"color":{"r":255,"g":255,"b":255},"colorTemInKelvin":0}}}
+            _LOGGER.info("Fetching govee %s device info...", self.name)
+            status, active = self.get_device_status()
+            _LOGGER.info("%s active: %s %s", self.name, active, status)
+            if not active:
+                self.set_offline()
+                return
+        else:
+            _LOGGER.info("Ignoring Govee status check for %s", self.name)
+
+        # the ordering and delay in this implementation is derived through trial and error only
+        # incorrect order can lead to flickering of devices tested if wake from sleep
+        # we have not other information as to best practice here
+        delay = 0.1
+        time.sleep(delay)
+        self.set_brightness(100)
+        time.sleep(delay)
+        self.send_activate()
+        super().activate()
+
+    def flush(self, data):
+        packet = encode_govee(data, self.config.stretch_to_fit)
+        try:
+            self.udp_server.sendto(packet, (self.config.ip_address, self.port))
+        except Exception as e:  # noqa: BLE001 - preserve session send policy
+            _LOGGER.info("govee:send_udp:Error sending UDP message %s", e)
+
+    # Get Device Status
+    def get_device_status(self):
+        self.send_devstatus_enquiry()
+        self.udp_server.settimeout(1.0)
+        try:
+            # Receive Response from the device
+            response, addr = self.udp_server.recvfrom(1024)
+            if self.config.ip_address == addr[0]:
+                return f"{response.decode('utf-8')}", True
+            else:
+                return (
+                    f"Discarding packet from unknown {addr[0]} on port {addr[1]}",
+                    False,
+                )
+
+        except TimeoutError:
+            return "No response received within the timeout period.", False
+
+    async def async_initialize(self):
+        await super().async_initialize()
+
+        config = {
+            "name": self.config.name,
+            "pixel_count": self.config.pixel_count,
+            "refresh_rate": self.config.refresh_rate,
+        }
+
+        self.update_config(config)

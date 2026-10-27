@@ -1,0 +1,82 @@
+import numpy as np  # noqa: N999
+from pydantic import Field
+
+from ledfx.color import RGB
+from ledfx.configuration.fields import CoercedFloat
+from ledfx.configuration.plugin import TypedConfig
+from ledfx.effects.audio import MAX_MIDI, MIN_MIDI, AudioReactiveEffect
+from ledfx.effects.gradient import GradientEffect
+
+
+class PitchSpectrumAudioEffect(AudioReactiveEffect, GradientEffect):
+    NAME = "Pitch Spectrum"
+    CATEGORY = "Classic"
+    USES_MELBANK_RANGE = True
+
+    class Config(GradientEffect.Config):
+        blur: CoercedFloat = Field(
+            1.0, description="Amount to blur the effect", ge=0.0, le=10
+        )
+        mirror: bool = Field(True, description="Mirror the effect")
+        fade_rate: CoercedFloat = Field(
+            0.15, description="Rate at which notes fade", ge=0.0, le=1.0
+        )
+        responsiveness: CoercedFloat = Field(
+            0.15, description="Responsiveness to note changes", ge=0.0, le=1.0
+        )
+
+    config = TypedConfig(Config)
+
+    def on_activate(self, pixel_count):
+        # protect from changes to the pixel count during segment edits
+        self.avg_midi = None
+        self.filtered_melbank = None
+
+    def config_updated(self, config):
+        self.avg_midi = None
+        self.filtered_melbank = None
+
+    def audio_data_updated(self, data):
+        # Grab the filtered melbank
+        self.filtered_melbank = self.melbank(filtered=False, size=self.pixel_count)
+        midi_value = data.pitch() or 0
+
+        if not self.avg_midi:
+            self.avg_midi = midi_value
+
+        # Average out the midi values to be a little more stable
+        if midi_value >= MIN_MIDI:
+            self.avg_midi = (
+                self.avg_midi * (1.0 - self.config.responsiveness)
+                + midi_value * self.config.responsiveness
+            )
+
+    def render(self):
+        # If the melbanks are empty, then we can't render anything yet
+        # This also catches avg_midi being None
+        if self.filtered_melbank is None:
+            return
+
+        # Calculate the note color based on where it falls in the midi range
+        if self.avg_midi >= MIN_MIDI:
+            midi_scaled = (self.avg_midi - MIN_MIDI) / (MAX_MIDI - MIN_MIDI)
+            midi_scaled = max(0, min(midi_scaled, 1))
+            note_color = self.get_gradient_color(midi_scaled)
+        else:
+            note_color = RGB(0, 0, 0)
+
+        # Mix in the new color based on the filterbank information and fade out
+        # the old colors
+        new_colors = np.multiply(
+            self.pixels, (1 - self.filtered_melbank[:, np.newaxis])
+        ) + np.multiply(note_color, self.filtered_melbank[:, np.newaxis])
+
+        # Apply fade_rate
+        fade_rate = self.config.fade_rate
+        black = np.zeros((self.pixel_count, 3))
+        new_colors = np.multiply(new_colors, (1 - fade_rate)) + np.multiply(
+            black, fade_rate
+        )
+        # Assign new_colors back to self.pixels
+        self.pixels = new_colors
+        self.roll_gradient()

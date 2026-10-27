@@ -1,0 +1,256 @@
+import logging
+from json import JSONDecodeError
+
+from aiohttp import web
+
+from ledfx.api import RestEndpoint
+from ledfx.api.v1_compat import effect_config as validated_effect_config
+from ledfx.configuration.fields import VirtualIdStr
+from ledfx.configuration.models import Preset
+from ledfx.configuration.presets import configs_match, preset_category, preset_config
+from ledfx.effects import DummyEffect
+from ledfx.errors import Conflict
+from ledfx.presets import ledfx_presets
+from ledfx.utils import (
+    generate_default_config,
+    generate_defaults,
+    generate_id,
+    inject_missing_default_keys,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class VirtualPresetsEndpoint(RestEndpoint):
+    ENDPOINT_PATH = "/api/virtuals/{virtual_id}/presets"
+
+    def _add_active_flags(self, presets_dict, active_effect_config):
+        """
+        Add 'active' flag to each preset based on whether it matches the active effect config.
+
+        Args:
+            presets_dict: Dictionary of presets to annotate
+            active_effect_config: Config of the currently active effect
+
+        Returns:
+            Dictionary with each preset annotated with 'active' boolean
+        """
+        annotated_presets = {}
+        for preset_id, preset_data in presets_dict.items():
+            preset_with_flag = dict(preset_data)
+            preset_config = preset_data.get("config", {})
+            preset_with_flag["active"] = configs_match(
+                preset_config, active_effect_config
+            )
+            annotated_presets[preset_id] = preset_with_flag
+        return annotated_presets
+
+    async def get(self, virtual_id) -> web.Response:
+        """
+        Get presets for active effect of a virtual
+
+        Parameters:
+        - virtual_id: The ID of the virtual
+
+        Returns:
+        - web.Response: The response containing the presets for the active effect of the virtual
+        """
+        virtual = self._ledfx.virtuals.get(virtual_id)
+        if virtual is None:
+            return await self.invalid_request(f"Virtual with ID {virtual_id} not found")
+
+        if not virtual.active_effect or isinstance(virtual.active_effect, DummyEffect):
+            return await self.invalid_request(
+                f"Virtual {virtual_id} has no active effect"
+            )
+        effect_id = virtual.active_effect.type
+
+        default = generate_defaults(ledfx_presets, self._ledfx.effects, effect_id)
+
+        custom = {
+            preset_id: preset.model_dump()
+            for preset_id, preset in self._ledfx.config.user_presets.get(
+                effect_id, {}
+            ).items()
+        }
+
+        custom = inject_missing_default_keys(custom, default)
+
+        # Add active flags to presets based on current effect config
+        active_effect_config = virtual.active_effect.config
+        default_with_active = self._add_active_flags(default, active_effect_config)
+        custom_with_active = self._add_active_flags(custom, active_effect_config)
+
+        response = {
+            "status": "success",
+            "virtual": virtual_id,
+            "effect": effect_id,
+            "ledfx_presets": default_with_active,
+            "user_presets": custom_with_active,
+        }
+        return await self.bare_request_success(response)
+
+    async def put(self, virtual_id, request) -> web.Response:
+        """Set active effect of virtual to a preset.
+
+        Args:
+            virtual_id (str): The ID of the virtual.
+            request (web.Request): The request object containing `category`, `effect_id`, and `preset_id`.
+
+        Returns:
+            web.Response: The HTTP response object.
+
+        Raises:
+            JSONDecodeError: If there is an error decoding the JSON data.
+        """
+        virtual = self._ledfx.virtuals.get(virtual_id)
+        if virtual is None:
+            return await self.invalid_request(f"Virtual with ID {virtual_id} not found")
+
+        try:
+            data = await request.json()
+        except JSONDecodeError:
+            return await self.json_decode_error()
+        category = data.get("category")
+        effect_id = data.get("effect_id")
+        preset_id = data.get("preset_id")
+
+        missing_attributes = []
+
+        if category is None:
+            missing_attributes.append("category")
+        if preset_id is None:
+            missing_attributes.append("preset_id")
+        if effect_id is None:
+            missing_attributes.append("effect_id")
+
+        if missing_attributes:
+            return await self.invalid_request(
+                f"Required attributes {', '.join(missing_attributes)} were not provided"
+            )
+        if not all(isinstance(v, str) for v in (category, effect_id, preset_id)):
+            return await self.invalid_request(
+                "category, effect_id and preset_id must be strings"
+            )
+        if effect_id not in self._ledfx.effects.types():
+            return await self.invalid_request(f"Unknown effect type: {effect_id}")
+
+        if category not in ["ledfx_presets", "user_presets"]:
+            return await self.invalid_request(
+                f'Category {category} is not "ledfx_presets" or "user_presets"'
+            )
+
+        if category == "ledfx_presets" and preset_id == "reset":
+            effect_config = generate_default_config(self._ledfx.effects, effect_id)
+        else:
+            user_presets = self._ledfx.config.user_presets
+            presets = preset_category(user_presets, category)
+            if effect_id not in presets:
+                return await self.invalid_request(
+                    f"Effect {effect_id} does not exist in category {category}"
+                )
+            if preset_id not in presets[effect_id]:
+                return await self.invalid_request(
+                    f"Preset {preset_id} does not exist for effect {effect_id} in category {category}"
+                )
+            else:
+                # Create the effect and add it to the virtual
+                effect_config = preset_config(
+                    user_presets, category, effect_id, preset_id
+                )
+
+        vid = VirtualIdStr(virtual_id)
+        try:
+            # v1-compat: the settings are checked here for pydantic's error
+            # list (HTTP 400); the manager is handed typed values.
+            virtual = self._ledfx.virtuals.set_effect(
+                vid,
+                effect_id,
+                validated_effect_config(self._ledfx, effect_id, effect_config),
+            )
+        except Conflict as err:
+            # v1-compat: the refusal text v1 has always answered with.
+            error_message = f"Unable to set effect on virtual {vid}: {err.detail}"
+            _LOGGER.warning(error_message)
+            return await self.invalid_request(error_message)
+
+        effect = virtual.active_effect
+        effect_response = {}
+        effect_response["config"] = effect.config
+        effect_response["name"] = effect.name
+        effect_response["type"] = effect.type
+
+        response = {"status": "success", "effect": effect_response}
+        return await self.bare_request_success(response)
+
+    async def post(self, virtual_id, request) -> web.Response:
+        """
+        Save configuration of active virtual effect as a user preset.
+
+        Args:
+            virtual_id (str): The ID of the virtual effect.
+            request (web.Request): The request object containing the new preset `name`.
+
+        Returns:
+            web.Response: The HTTP response object.
+
+
+        """
+        virtual = self._ledfx.virtuals.get(virtual_id)
+        if virtual is None:
+            return await self.invalid_request(f"Virtual with ID {virtual_id} not found")
+
+        if not virtual.active_effect or isinstance(virtual.active_effect, DummyEffect):
+            return await self.invalid_request(
+                f"Virtual {virtual_id} has no active effect"
+            )
+
+        try:
+            data = await request.json()
+        except JSONDecodeError:
+            return await self.json_decode_error()
+        preset_name = data.get("name")
+        if preset_name is None:
+            return await self.invalid_request(
+                'Required attribute "name" was not provided'
+            )
+        # Validate before touching user_presets.
+        preset = Preset(name=preset_name, config=virtual.active_effect.config.as_dict())
+
+        preset_id = generate_id(preset_name)
+        effect_id = virtual.active_effect.type
+
+        # Update the preset if it already exists, else create it
+        self._ledfx.config.user_presets.setdefault(effect_id, {})[preset_id] = preset
+
+        self._ledfx.config_store.request_save()
+
+        response = {
+            "status": "success",
+            "preset": {
+                "id": preset_id,
+                "name": preset_name,
+                "config": virtual.active_effect.config,
+            },
+        }
+        return await self.bare_request_success(response)
+
+    async def delete(self, virtual_id) -> web.Response:
+        # TODO: This API is not currently used
+        # TODO: https://github.com/LedFx/LedFx/issues/1231
+        """Delete a virtual preset.
+
+        Args:
+            virtual_id (str): The ID of the virtual preset to delete.
+
+        Returns:
+            web.Response: The response indicating the success of the deletion.
+        """
+        virtual = self._ledfx.virtuals.get(virtual_id)
+        if virtual is None:
+            return await self.invalid_request(f"Virtual with ID {virtual_id} not found")
+
+        self._ledfx.virtuals.clear_effect(VirtualIdStr(virtual_id))
+
+        response = {"status": "success", "effect": {}}
+        return await self.bare_request_success(response)

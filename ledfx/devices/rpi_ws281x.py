@@ -1,0 +1,145 @@
+import logging
+from typing import Annotated, Literal
+
+from pydantic import Field
+
+from ledfx.configuration.fields import X_REQUIRED, OneOf
+from ledfx.configuration.plugin import TypedConfig
+from ledfx.devices import Device
+from ledfx.devices.utils.rgbw_conversion import (
+    RGB_MAPPING,
+    WHITE_FUNCS_MAPPING,
+    OutputMode,
+)
+from ledfx.utils import BaseRegistry
+
+_LOGGER = logging.getLogger(__name__)
+
+try:
+    from rpi_ws281x import (
+        SK6812_STRIP_RGBW,
+        WS2811_STRIP_RGB,
+        PixelStrip,
+    )
+
+    rpi_supported = True
+except ImportError:
+    rpi_supported = False
+
+
+# This wrapper is required to prevent config_update lifecycle breakage
+# You cannot inherit from Device directly
+@BaseRegistry.no_registration
+class DeviceWrapper(Device):
+    pass
+
+
+class RPI_WS281X(DeviceWrapper):
+    """RPi WS281X/SK6812 device support"""
+
+    class Config(DeviceWrapper.Config):
+        pixel_count: int = Field(
+            1,
+            description="Number of individual pixels",
+            ge=1,
+            json_schema_extra={X_REQUIRED: True},
+        )
+        gpio_pin: Literal[10, 12, 13, 18, 21] = Field(
+            10,
+            description="Raspberry Pi GPIO pin your LEDs are connected to",
+            json_schema_extra={X_REQUIRED: True},
+        )
+        color_order: Annotated[str, OneOf(RGB_MAPPING)] = Field(
+            "RGB",
+            description="RGB data order mode, supported for physical hardware that just doesn't play by the rules",
+        )
+        white_mode: Annotated[str, OneOf(WHITE_FUNCS_MAPPING.keys())] = Field(
+            "None",
+            description="White channel handling mode, if RGB leave as None. Commonly written as RGBW or RGBA",
+        )
+
+    config = TypedConfig(Config)
+
+    def __init__(self, ledfx, config):
+        super().__init__(ledfx, config)
+        self.LED_FREQ_HZ = 800000
+        self.LED_DMA = 10
+        self.LED_BRIGHTNESS = 255
+        self.LED_INVERT = False
+        self.LED_CHANNEL = 0
+        self._device_type = "RPi_WS281X"
+        self.color_order = self.config.color_order
+        self.white_mode = self.config.white_mode or "None"
+        self.output_mode = OutputMode(self.color_order, self.white_mode)
+        self.activate()
+
+    OUTPUT_KEYS = ("gpio_pin", "pixel_count", "color_order", "white_mode")
+
+    def config_updated(self, config):
+        if not self._output_changed():
+            return
+        self.color_order = self.config.color_order
+        self.white_mode = self.config.white_mode or "None"
+        self.output_mode = OutputMode(self.color_order, self.white_mode)
+        self.deactivate()
+        self.activate()
+        self._built_settings = self._output_settings()
+
+    def activate(self):
+        if not rpi_supported:
+            _LOGGER.warning("Unable to load ws281x module - are you on a Raspberry Pi?")
+            self.set_offline()
+            return
+
+        # following configuration is based on the example from the rpi-ws281x library
+        # https://github.com/rpi-ws281x/rpi-ws281x-python/blob/50cc48bbb5d6ab2d205e58606892514a29571f5e/examples/strandtest.py#L20
+        self.LED_CHANNEL = 1 if self.config.gpio_pin == 13 else 0
+
+        if self.white_mode == "None":  # RGB strip
+            strip_type = WS2811_STRIP_RGB
+        else:  # RGBW strip
+            strip_type = SK6812_STRIP_RGBW
+
+        self.strip = PixelStrip(
+            self.pixel_count,
+            self.config.gpio_pin,
+            self.LED_FREQ_HZ,
+            self.LED_DMA,
+            self.LED_INVERT,
+            self.LED_BRIGHTNESS,
+            self.LED_CHANNEL,
+            strip_type,
+        )
+
+        self.strip.begin()
+        super().activate()
+
+    def deactivate(self):
+        super().deactivate()
+
+    def flush(self, data):
+        """Flush LED data to the strip"""
+
+        # Apply color mapping function
+        data = self.output_mode.apply(data)
+
+        # Switch between 24bit (RGB) and 32bit (RGBW) output
+        if self.white_mode == "None":
+            # RGB: R, G, B
+            def color_func(c):
+                return (round(c[0]) << 16) | (round(c[1]) << 8) | round(c[2])
+
+        else:
+            # RGBW: W, R, G, B
+            def color_func(c):
+                return (
+                    (round(c[3]) << 24)
+                    | (round(c[0]) << 16)
+                    | (round(c[1]) << 8)
+                    | round(c[2])
+                )
+
+        for idx, color in enumerate(data):
+            self.strip.setPixelColor(idx, color_func(color))
+
+        self.strip.show()

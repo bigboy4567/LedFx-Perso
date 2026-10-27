@@ -1,0 +1,277 @@
+import logging
+
+import numpy as np
+from PIL import Image, ImageDraw
+from pydantic import Field
+
+from ledfx.configuration.fields import CoercedFloat, CoercedInt
+from ledfx.configuration.plugin import TypedConfig
+from ledfx.effects.gradient import GradientEffect
+from ledfx.effects.twod import Twod
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class Waterfall(Twod, GradientEffect):
+    """
+    A 2D waterfall effect for LED matrices. This effect creates a scrolling
+    waterfall-like visualization based on audio data, with configurable
+    frequency bands, scrolling speed, and gradient colors.
+    """
+
+    NAME = "Waterfall"
+    CATEGORY = "Matrix"
+    USES_MELBANK_RANGE = True
+    HIDDEN_KEYS = Twod.HIDDEN_KEYS + [
+        "background_mode",
+    ]
+    ADVANCED_KEYS = Twod.ADVANCED_KEYS + [
+        "max_vs_mean",
+        "background_color",
+        "background_brightness",
+    ]
+
+    class Config(Twod.Config, GradientEffect.Config):
+        center: bool = Field(False, description="Center the waterfall")
+        max_vs_mean: bool = Field(
+            False, description="Use max or mean value for bar size"
+        )
+        bands: CoercedInt = Field(
+            16, description="Number of frequency bands", ge=1, le=64
+        )
+        drop_secs: CoercedFloat = Field(
+            3.0,
+            description="Seconds for the waterfall to drop from the top to bottom of the matrix",
+            ge=0.1,
+            le=10.0,
+        )
+        fade_out: CoercedFloat = Field(
+            0.0, description="Fade out the waterfall effect", ge=0.0, le=1.0
+        )
+
+    config = TypedConfig(Config)
+
+    def __init__(self, ledfx, config):
+        """
+        Initialize the Waterfall effect.
+
+        Args:
+            ledfx: The LedFx instance.
+            config: Configuration dictionary for the effect.
+        """
+        super().__init__(ledfx, config)
+
+    def on_activate(self, pixel_count):
+        """
+        Called when the effect is activated. Initializes variables.
+
+        Args:
+            pixel_count: The number of pixels in the matrix.
+        """
+        self.r = np.zeros(pixel_count)
+        self.o_width = 0
+        self.o_height = 0
+        self.history = None
+
+    def config_updated(self, config):
+        """
+        Called when the effect configuration is updated.
+
+        Args:
+            config: The updated configuration dictionary.
+        """
+        super().config_updated(config)
+        self.bands = self.config.bands
+        self.center = self.config.center
+        self.grad_roll = self.config.gradient_roll
+        self.max = self.config.max_vs_mean
+        self.drop_secs = self.config.drop_secs
+        self.fade_out = self.config.fade_out
+        # we are going to do our own special thing with background color so disable default behavior
+        self.bg_color_use = False
+
+    def do_once(self):
+        """
+        Perform one-time setup tasks that depend on the pixel count.
+        """
+        super().do_once()
+        self.bands = min(self.bands, self.pixel_count)
+        self.bandsx = []
+        for i in range(self.bands):
+            start = int((self.r_width / float(self.bands)) * i)
+            end = max(start, int(((self.r_width / float(self.bands)) * (i + 1)) - 1))
+            self.bandsx.append([start, end])
+        # protect from 0 half_height and divide by zero risk
+        self.half_height = max(1, int(self.r_height // 2))
+        self.half_odd = bool(self.r_height % 2)
+
+        if (
+            self.history is None
+            or self.o_height != self.r_height
+            or self.o_width != self.r_width
+        ):
+            self.history = Image.new("RGB", (self.r_width, self.r_height))
+            self.h_draw = ImageDraw.Draw(self.history)
+
+        self.o_width = self.r_width
+        self.o_height = self.r_height
+
+        self.drop_tick = self.drop_secs / self.r_height
+
+        if self.center:
+            self.drop_tick = self.drop_tick * 2
+        self.drop_remainder = 0.0
+
+        # generate a grey scale fade mask based on fade_out
+        self.fade_mask = None
+        self.black_bg = None
+        if self.fade_out > 0.0:
+            # Create fade mask - fades linearly in scroll direction
+            self.fade_mask = Image.new("L", (self.r_width, self.r_height))
+            mask_draw = ImageDraw.Draw(self.fade_mask)
+
+            if self.center:
+                for y in range(self.r_height):
+                    distance = abs(y - self.half_height)
+                    fade_factor = max(
+                        0.0,
+                        1.0 - (distance / self.half_height) * self.fade_out * 2.0,
+                    )
+                    grey_value = int(fade_factor * 255)
+                    mask_draw.line((0, y, self.r_width - 1, y), fill=grey_value)
+            else:
+                for y in range(self.r_height):
+                    fade_factor = max(0.0, 1.0 - (y / self.half_height) * self.fade_out)
+                    grey_value = int(fade_factor * 255)
+                    mask_draw.line((0, y, self.r_width - 1, y), fill=grey_value)
+
+            self.waterfall_background = Image.new(
+                "RGB", (self.r_width, self.r_height), self._bg_color_pil
+            )
+
+    def audio_data_updated(self, data):
+        """
+        Update the audio data for the effect.
+
+        Args:
+            data: The audio data to process.
+        """
+        self.r = self.melbank(filtered=True, size=self.pixel_count)
+        np.clip(self.r, 0, 1, out=self.r)
+
+    def prep_frame_vars(self):
+        """
+        Prepare variables for rendering the current frame.
+        """
+        r_split = np.array_split(self.r, self.bands)
+        if self.max:
+            self.volumes = np.array([split.max() for split in r_split])
+        else:
+            self.volumes = np.array([split.mean() for split in r_split])
+
+        self.new_row_colors = self.get_gradient_color_vectorized1d(self.volumes).astype(
+            int
+        )
+
+    def scroll_history_one_row(self):
+        """
+        Scroll the history image down by one row.
+        """
+        w, h = self.history.size
+
+        # if there is no space to scroll just return
+        if h < 2:
+            return
+
+        region = self.history.crop((0, 0, w, h - 1))
+        self.history.paste(region, (0, 1))
+
+    def scroll_center_history_one_row(self):
+        """
+        Scroll the history image from the center by one row.
+        """
+        w, h = self.history.size
+
+        # if there is no space to scroll just return
+        if (self.half_odd and h < 3) or (not self.half_odd and h < 4):
+            return
+
+        region = self.history.crop((0, self.half_height, w, h - 1))
+        self.history.paste(region, (0, self.half_height + 1))
+
+        # top half depend on odd/even height
+        if self.half_odd:
+            region = self.history.crop((0, 1, w, self.half_height + 1))
+        else:
+            region = self.history.crop((0, 1, w, self.half_height))
+        self.history.paste(region, (0, 0))
+
+    def process_history(self):
+        """
+        Process the history image by scrolling it based on elapsed time.
+        """
+        total_time = self.passed + self.drop_remainder
+        ticks, self.drop_remainder = divmod(total_time, self.drop_tick)
+
+        # _LOGGER.info("Waterfall dropping %s ticks", ticks)
+        for _ in range(int(ticks)):
+            if self.center:
+                self.scroll_center_history_one_row()
+            else:
+                self.scroll_history_one_row()
+
+    def draw_normal(self):
+        """
+        Draw the current frame onto the history image.
+        """
+        for i in range(self.bands):
+            band_start, band_end = self.bandsx[i]
+
+            color = tuple(self.new_row_colors[i])
+
+            if self.center:
+                self.h_draw.line(
+                    (band_start, self.half_height, band_end, self.half_height),
+                    fill=color,
+                )
+
+                if not self.half_odd:
+                    self.h_draw.line(
+                        (
+                            band_start,
+                            self.half_height - 1,
+                            band_end,
+                            self.half_height - 1,
+                        ),
+                        fill=color,
+                    )
+
+            else:
+                self.h_draw.line(
+                    (band_start, 0, band_end, 0),
+                    fill=color,
+                )
+
+        self.matrix.paste(self.history)
+
+    def draw(self):
+        """
+        Render the current frame of the effect.
+        """
+
+        if self.test:
+            self.draw_test(self.m_draw)
+
+        self.prep_frame_vars()
+
+        self.process_history()
+
+        self.draw_normal()
+
+        # Apply fade out effect if enabled
+        if self.fade_out > 0.0:
+            self.matrix = Image.composite(
+                self.matrix, self.waterfall_background, self.fade_mask
+            )
+
+        self.roll_gradient()

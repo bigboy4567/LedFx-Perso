@@ -1,0 +1,232 @@
+import itertools
+import logging
+
+import numpy as np
+from pydantic import Field
+
+from ledfx.color import RGB, parse_gradient
+from ledfx.configuration.fields import CoercedFloat, Gradient
+from ledfx.configuration.plugin import TypedConfig
+from ledfx.effects import Effect
+from ledfx.effects.modulate import ModulateEffect
+from ledfx.effects.temporal import TemporalEffect
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@Effect.no_registration
+class GradientEffect(Effect):
+    """
+    Simple effect base class that supplies gradient functionality. This
+    is intended for effect which instead of outputing exact colors output
+    colors based upon some configured color pallet.
+    """
+
+    class Config(Effect.Config):
+        gradient: Gradient = Field(
+            "linear-gradient(90deg, rgb(255, 0, 0) 0%, rgb(255, 120, 0) 14%, rgb(255, 200, 0) 28%, rgb(0, 255, 0) 42%, rgb(0, 199, 140) 56%, rgb(0, 0, 255) 70%, rgb(128, 0, 128) 84%, rgb(255, 0, 178) 98%)",
+            description="Color gradient to display",
+        )
+        gradient_roll: CoercedFloat = Field(
+            0, description="Amount to shift the gradient", ge=0, le=10
+        )
+
+    config = TypedConfig(Config)
+
+    _gradient_curve = None
+    _gradient_roll_counter: float = 0
+
+    def _comb(self, N, k):
+        N = int(N)
+        k = int(k)
+
+        if k > N or N < 0 or k < 0:
+            return 0
+
+        M = N + 1
+        nterms = min(k, N - k)
+        numerator = 1
+        denominator = 1
+
+        for j in range(1, nterms + 1):
+            numerator *= M - j
+            denominator *= j
+
+        return numerator // denominator
+
+    def _bernstein_poly(self, i, n, t):
+        """The Bernstein polynomial of n, i as a function of t"""
+        return self._comb(n, i) * (t ** (n - i)) * (1 - t) ** i
+
+    def _ease(self, chunk_len, start_val, end_val, slope=1.5):
+        x = np.linspace(0, 1, chunk_len)
+        diff = end_val - start_val
+        pow_x = np.power(x, slope)
+        return diff * pow_x / (pow_x + np.power(1 - x, slope)) + start_val
+
+    def _generate_gradient_curve(self, gradient, gradient_length):
+        _LOGGER.debug("Generating new gradient curve: %s", gradient)
+
+        try:
+            gradient = parse_gradient(gradient)
+        except ValueError:
+            gradient = RGB(0, 0, 0)
+
+        if isinstance(gradient, RGB):
+            self._gradient_curve = (
+                np.tile(gradient, (gradient_length, 1)).astype(float).T
+            )
+            return
+
+        gradient_colors = gradient.colors
+
+        # fill in start and end colors if not explicitly given
+        if gradient_colors[0][1] != 0.0:
+            gradient_colors.insert(0, (gradient_colors[0][0], 0.0))
+
+        if gradient_colors[-1][1] != 1.0:
+            gradient_colors.insert(-1, (gradient_colors[-1][0], 1.0))
+
+        # split colors and splits into two separate groups
+        gradient_colors, gradient_splits = zip(*gradient_colors)
+
+        # turn splits into real indexes to split array
+        gradient_splits = [
+            int(gradient_length * position)
+            for position in gradient_splits
+            if 0 < position < 1
+        ]
+        # pair colors (1,2), (2,3), (3,4) for color transition of each segment
+        gradient_colors_paired = itertools.pairwise(gradient_colors)
+
+        # create gradient array and split it up into the segments
+        gradient = np.zeros((gradient_length, 3)).astype(float)
+        gradient_segments = np.split(gradient, gradient_splits, axis=0)
+
+        for (color_1, color_2), segment in zip(
+            gradient_colors_paired, gradient_segments
+        ):
+            segment_len = len(segment)
+            segment[:, 0] = self._ease(segment_len, color_1[0], color_2[0])
+            segment[:, 1] = self._ease(segment_len, color_1[1], color_2[1])
+            segment[:, 2] = self._ease(segment_len, color_1[2], color_2[2])
+
+        self._gradient_curve = gradient.T
+
+    @property
+    def gradient_pixel_count(self):
+        """Returns the number of pixels for the gradient"""
+        return max(self.pixel_count, 256)
+
+    def _assert_gradient(self):
+        if (
+            self._gradient_curve is None  # Uninitialized gradient
+            or len(self._gradient_curve[0])
+            != self.gradient_pixel_count  # Incorrect size
+        ):
+            self._generate_gradient_curve(
+                self.config.gradient,
+                self.gradient_pixel_count,
+            )
+
+    def roll_gradient(self):
+        if self.config.gradient_roll == 0:
+            return
+
+        self._assert_gradient()
+
+        increment = (
+            self.config.gradient_roll / self.pixel_count * self.gradient_pixel_count
+        )
+        self._gradient_roll_counter += increment
+
+        if self._gradient_roll_counter >= 1.0:
+            pixels_to_roll = np.floor(self._gradient_roll_counter)
+            self._gradient_roll_counter -= pixels_to_roll
+
+            self._gradient_curve = np.roll(
+                self._gradient_curve,
+                int(pixels_to_roll),
+                axis=1,
+            )
+
+    def _get_gradient_colors(self, points):
+        self._assert_gradient()
+
+        # Ensure points are within the valid range [0, 1]
+        points = np.clip(points, 0, 1)
+
+        # Calculate indices for the gradient lookup
+        indices = ((self.gradient_pixel_count - 1) * points).astype(int)
+
+        assert self._gradient_curve is not None
+        # Gather contiguous RGB triples, retaining the channel-first API.
+        return np.moveaxis(np.take(self._gradient_curve.T, indices, axis=0), -1, 0)
+
+    def get_gradient_color(self, point):
+        return self._get_gradient_colors(point)
+
+    def get_gradient_color_vectorized2d(self, points):
+        colors = self._get_gradient_colors(points)
+
+        # Transpose and reshape to get the correct shape (height, width, color_channels)
+        return colors.transpose(1, 2, 0)
+
+    def get_gradient_color_vectorized1d(self, points):
+        colors = self._get_gradient_colors(points)
+
+        # Transpose and reshape to get the correct shape (length, color_channels)
+        return colors.transpose(1, 0)
+
+    def get_gradient(self):
+        self._assert_gradient()
+
+        # For a single pixel, take the first value from the gradient
+        if self.pixel_count == 1:
+            return self._get_gradient_colors([0])
+
+        # For low pixel counts, downsample the gradient
+        if self.pixel_count < self.gradient_pixel_count:
+            points = np.arange(self.pixel_count) / (self.pixel_count - 1)
+            return self._get_gradient_colors(points)
+
+        # For large pixel counts, the gradient corresponds to the number of pixels
+        return self._gradient_curve
+
+    def config_updated(self, config):
+        """Invalidate the gradient"""
+        self._gradient_curve = None
+
+    def apply_gradient(self, y):
+        self._assert_gradient()
+
+        output = self.get_gradient() * y
+        # Apply and roll the gradient if necessary
+        self.roll_gradient()
+
+        return output.T
+
+
+class TemporalGradientEffect(TemporalEffect, GradientEffect, ModulateEffect):
+    """
+    A simple effect that just applies a gradient to the channel. This
+    is essentially just the temporal exposure of gradients.
+    """
+
+    class Config(TemporalEffect.Config, GradientEffect.Config, ModulateEffect.Config):
+        pass
+
+    config = TypedConfig(Config)
+
+    NAME = "Gradient"
+    CATEGORY = "Non-Reactive"
+
+    def on_activate(self, pixel_count):
+        pass
+
+    def effect_loop(self):
+        # TODO: Could add some cool effects like twinkle or sin modulation
+        # of the gradient.
+        # kinda done
+        pixels = self.apply_gradient(1)
+        self.pixels = self.modulate(pixels)

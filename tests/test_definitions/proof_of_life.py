@@ -1,0 +1,100 @@
+from tests.test_utilities.test_utils import APITestCase
+
+proof_of_life_tests = {
+    "quick_health_check": APITestCase(
+        execution_order=1,
+        method="GET",
+        api_endpoint="/api/info",
+        expected_return_code=200,
+        expected_response_keys=[
+            "url",
+            "name",
+            "version",
+            "developer_mode",
+            "config_error",
+        ],
+    ),
+    "get_audio_devices": APITestCase(
+        execution_order=2,
+        method="GET",
+        api_endpoint="/api/audio/devices",
+        expected_return_code=200,
+        expected_response_keys=["active_device_index", "devices"],
+    ),
+    "color_endpoint": APITestCase(
+        execution_order=3,
+        method="GET",
+        api_endpoint="/api/colors",
+        expected_return_code=200,
+        expected_response_keys=["colors", "gradients"],
+    ),
+    "config_endpoint": APITestCase(
+        execution_order=4,
+        method="GET",
+        api_endpoint="/api/config",
+        expected_return_code=200,
+    ),
+    "effects_endpoint_empty": APITestCase(
+        execution_order=5,
+        method="GET",
+        api_endpoint="/api/effects",
+        expected_return_code=200,
+        expected_response_keys=["status", "effects"],
+    ),
+    "devices_endpoint_empty": APITestCase(
+        execution_order=6,
+        method="GET",
+        api_endpoint="/api/devices",
+        expected_return_code=200,
+        expected_response_keys=["status", "devices"],
+    ),
+    "find_devices_get": APITestCase(
+        execution_order=7,
+        method="GET",
+        api_endpoint="/api/find_devices",
+        expected_return_code=200,
+        expected_response_keys=["status"],
+    ),
+    "find_devices_post": APITestCase(
+        execution_order=8,
+        method="POST",
+        api_endpoint="/api/find_devices",
+        expected_return_code=200,
+        expected_response_keys=["status"],
+        payload_to_send={"name_to_icon": {"test": "test"}},
+    ),
+    "scenes_list_empty": APITestCase(
+        execution_order=9,
+        method="GET",
+        api_endpoint="/api/scenes",
+        expected_return_code=200,
+        expected_response_keys=["status", "scenes"],
+    ),
+    # The playlist manager is created with the core, not on first use.
+    "playlists_list": APITestCase(
+        execution_order=10,
+        method="GET",
+        api_endpoint="/api/playlists",
+        expected_return_code=200,
+        expected_response_keys=["playlists"],
+    ),
+    # v2 is mounted by HttpServer.start(); clients detect it by this route.
+    "v2_system": APITestCase(
+        execution_order=11,
+        method="GET",
+        api_endpoint="/api/v2/system",
+        expected_return_code=200,
+        expected_response_keys=["name", "version", "api_versions"],
+        expected_response_values=[{"api_versions": ["v1", "v2"]}],
+    ),
+    # If we have a dirty config, clean up the test jig before we start
+    "cleanup_test_device": APITestCase(
+        execution_order=3,
+        method="DELETE",
+        api_endpoint="/api/virtuals/ci-test-jig",
+        expected_return_code=200,
+        expected_response_keys=[],
+        expected_response_values=[],
+        payload_to_send={},
+    ),
+}

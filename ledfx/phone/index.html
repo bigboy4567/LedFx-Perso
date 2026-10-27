@@ -1,0 +1,859 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#101218">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Pinceau LED">
+<link rel="apple-touch-icon" sizes="180x180" href="/favicon/apple-icon-180x180.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon/favicon-32x32.png">
+<title>Pinceau LED</title>
+<style>
+  :root {
+    --bg: #101218;
+    --panel: #1a1d26;
+    --panel-2: #232735;
+    --line: #2e3344;
+    --text: #eef0f6;
+    --muted: #9aa1b5;
+    --accent: #6c8cff;
+    --danger: #ff5c6c;
+    --ok: #3ddc84;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: max(12px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+      max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    touch-action: manipulation;
+    min-height: 100vh; min-height: 100dvh;
+  }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  header h1 { font-size: 20px; margin: 0; flex: 1; }
+  header a { color: var(--muted); font-size: 14px; text-decoration: none; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); flex: none; }
+  .dot.on { background: var(--ok); }
+  section { display: none; }
+  section.shown { display: block; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
+  .note { color: var(--muted); font-size: 14px; margin: 6px 0 0; }
+  .warn { border-color: #6b4b1f; background: #2a2116; }
+  .warn a { color: #ffc46b; word-break: break-all; }
+  .strips { display: grid; gap: 8px; }
+  .strip { display: flex; align-items: center; gap: 10px; padding: 12px; border-radius: 10px;
+    background: var(--panel-2); border: 2px solid transparent; }
+  .strip.picked { border-color: var(--accent); }
+  .strip b { flex: 1; font-weight: 600; }
+  .strip small { color: var(--muted); }
+  .choice { display: flex; gap: 6px; background: var(--panel-2); border-radius: 10px; padding: 4px; }
+  .choice button { flex: 1; border: 0; border-radius: 8px; padding: 10px 6px; background: transparent;
+    color: var(--muted); font: inherit; font-size: 14px; }
+  .choice button.picked { background: var(--accent); color: #fff; }
+  .btn { display: block; width: 100%; border: 0; border-radius: 12px; padding: 15px; font: inherit;
+    font-weight: 600; background: var(--accent); color: #fff; margin-top: 10px; }
+  .btn.ghost { background: var(--panel-2); color: var(--text); }
+  .btn.danger { background: #3a1d24; color: #ffb3bc; }
+  .btn:disabled { opacity: .45; }
+  .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(90px, 1fr)); gap: 8px; }
+  .row .btn { margin-top: 0; padding: 12px 6px; font-size: 14px; }
+  .row.two { grid-template-columns: 1fr 1fr; }
+  .nudge { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+  .nudge[hidden] { display: none; }
+  .nudge .btn { margin: 0; width: 64px; padding: 10px; font-size: 18px; }
+  .nudge span { flex: 1; text-align: center; color: var(--muted); font-size: 14px; }
+  .step { font-size: 44px; font-weight: 700; text-align: center; margin: 4px 0; }
+  .big-text { font-size: 18px; text-align: center; margin: 0 0 6px; }
+  .bar { position: relative; height: 54px; border-radius: 12px; background: #07080b;
+    border: 1px solid var(--line); overflow: hidden; touch-action: none; }
+  .bar canvas { width: 100%; height: 100%; display: block; }
+  .bar .hint { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
+    font-size: 13px; pointer-events: none; }
+  .palette { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
+  .swatch { aspect-ratio: 1; border-radius: 50%; border: 3px solid transparent; padding: 0; position: relative; }
+  .swatch.picked { border-color: #fff; box-shadow: 0 0 0 2px var(--bg) inset; }
+  .swatch.rainbow { background: conic-gradient(red, yellow, lime, cyan, blue, magenta, red); }
+  .swatch.eraser { background: repeating-conic-gradient(#333 0 25%, #666 0 50%) 50% / 12px 12px; }
+  .swatch input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; }
+  .swatch.custom { background: var(--panel-2); border: 2px dashed var(--muted); }
+  .swatch.custom::after { content: "+"; position: absolute; inset: 0; display: grid; place-items: center;
+    font-size: 26px; color: var(--text); pointer-events: none; text-shadow: 0 0 4px #000; }
+  .swatch.custom.picked { border-style: solid; border-color: #fff; }
+  label.slider { display: block; margin-top: 12px; font-size: 14px; color: var(--muted); }
+  label.slider span { float: right; color: var(--text); }
+  input[type=range] { width: 100%; accent-color: var(--accent); height: 30px; }
+  .paint { margin: 0; height: 30vh; min-height: 170px; border-radius: 22px; border: 0; width: 100%;
+    font: inherit; font-size: 24px; font-weight: 800; letter-spacing: .08em; color: #fff;
+    background: radial-gradient(circle at 50% 40%, #3a4472, #1d2238); touch-action: none; }
+  .paint.down { background: radial-gradient(circle at 50% 40%, var(--brush, #6c8cff), #1d2238 85%); }
+  .banner { position: sticky; top: 0; z-index: 2; background: #3a2a10; border: 1px solid #7a5a20;
+    color: #ffd58a; border-radius: 12px; padding: 12px; margin-bottom: 12px; display: none; }
+  .banner.shown { display: block; }
+  .banner .btn { margin-top: 8px; padding: 10px; }
+  details { margin-top: 10px; color: var(--muted); font-size: 14px; }
+  details a { color: var(--accent); }
+  summary { cursor: pointer; }
+  ol { padding-left: 20px; margin: 8px 0 0; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot" title="Connexion"></span>
+  <h1>Pinceau LED</h1>
+  <a href="/">LedFx complet ›</a>
+</header>
+
+<section id="setup" class="shown">
+  <div class="card warn" id="insecure" hidden>
+    <b>Les capteurs du téléphone exigent une connexion sécurisée.</b>
+    <p class="note" id="insecure-text">Seul le mode « Glisser » marche sur cette adresse.</p>
+  </div>
+  <div class="card" id="desktop" hidden>
+    <h2>Sur ton téléphone</h2>
+    <p class="note">Ouvre cette adresse, puis « Ajouter à l'écran d'accueil » :</p>
+    <p><b id="desktop-url"></b></p>
+  </div>
+  <div class="card">
+    <h2>Quel ruban ?</h2>
+    <div class="strips" id="strips"><p class="note">Chargement…</p></div>
+  </div>
+  <div class="card">
+    <h2>Comment tu tiens le téléphone ?</h2>
+    <div class="choice" id="aim-style">
+      <button data-v="top">Haut vers le ruban<br><small>comme une télécommande</small></button>
+      <button data-v="back">Dos vers le ruban<br><small>comme pour une photo</small></button>
+    </div>
+  </div>
+  <button class="btn" id="start" disabled>Commencer à peindre</button>
+  <details>
+    <summary>Le téléphone affiche un avertissement de sécurité ?</summary>
+    <p>Installe le certificat de ton PC une seule fois :</p>
+    <ol>
+      <li><a href="/phone/ca.crt">Télécharger le certificat</a>, puis Autoriser.</li>
+      <li>iPhone : Réglages › Profil téléchargé › Installer.</li>
+      <li>iPhone : Réglages › Général › Informations › Réglages des certificats › activer la confiance totale.</li>
+      <li>Android : Paramètres › Sécurité › Chiffrement › Installer un certificat › Certificat CA.</li>
+    </ol>
+    <p>Ce certificat ne vaut que pour les adresses de ton réseau local et le nom de ton PC.</p>
+  </details>
+</section>
+
+<section id="calibrate">
+  <div class="card">
+    <p class="big-text" id="cal-text">Vise le point qui clignote sur le ruban</p>
+    <div class="step" id="cal-step">1 / 3</div>
+    <p class="note" id="cal-note">Garde le téléphone immobile, puis touche Valider.</p>
+    <button class="btn" id="cal-ok">Valider</button>
+    <div class="row" style="margin-top:8px">
+      <button class="btn ghost" id="cal-precise">Calibration précise (5 points)</button>
+      <button class="btn ghost" id="cal-cancel">Annuler</button>
+    </div>
+  </div>
+</section>
+
+<section id="paint">
+  <div class="banner" id="idle">
+    Un autre effet a pris le ruban.
+    <button class="btn" id="retake">Reprendre le ruban</button>
+  </div>
+  <div class="card">
+    <div class="choice" id="mode">
+      <button data-v="aim">Viser</button>
+      <button data-v="tilt">Incliner</button>
+      <button data-v="slide">Glisser</button>
+    </div>
+    <p class="note" id="mode-note"></p>
+    <div class="bar" id="bar" style="margin-top:10px">
+      <canvas id="bar-canvas"></canvas>
+      <div class="hint" id="bar-hint"></div>
+    </div>
+    <div class="nudge" id="nudge">
+      <button class="btn ghost" id="nudge-left" aria-label="Décaler vers la gauche">◀</button>
+      <span id="nudge-out">Décalage : aucun</span>
+      <button class="btn ghost" id="nudge-right" aria-label="Décaler vers la droite">▶</button>
+    </div>
+    <p class="note" id="drift"></p>
+  </div>
+  <button class="paint" id="paint-btn">PEINDRE</button>
+  <div class="card" style="margin-top:12px">
+    <div class="palette" id="palette"></div>
+    <label class="slider">Taille du pinceau <span id="size-out"></span>
+      <input type="range" id="size" min="1" max="40" step="1"></label>
+    <label class="slider">Traînée <span id="fade-out"></span>
+      <input type="range" id="fade" min="0" max="20" step="1"></label>
+  </div>
+  <div class="row two">
+    <button class="btn ghost" id="clear">Tout effacer</button>
+    <button class="btn ghost" id="fill">Remplir</button>
+    <button class="btn ghost" id="recenter">Recentrer</button>
+    <button class="btn ghost" id="recalibrate">Recalibrer</button>
+  </div>
+  <button class="btn danger" id="finish">Terminer et remettre l'effet d'avant</button>
+</section>
+
+<script>
+"use strict";
+
+const EFFECT = "phone_paint";
+// Pure hues: Phone Paint turns screen colors into LED drive, and a tint that a
+// screen hides still shows on LEDs
+const COLORS = ["#ff0000", "#ff8000", "#ffd000", "#00ff00", "#00ffff", "#0040ff",
+                "#8a00ff", "#ff2a9d", "#ffffff"];
+// The compass pulls the gyroscope back over this many seconds: slow enough to
+// smooth the compass's jitter, quick enough that drift never builds up
+const DRIFT_SECONDS = 2;
+// Pointing past the ends of the strip by more than this hides the cursor
+const OFF_STRIP = 0.04;
+// Resend an unchanged pointer this often, so the strip keeps showing the cursor
+const KEEPALIVE_MS = 300;
+// Tilt mode: this many degrees left or right reaches the end of the strip
+const TILT_RANGE = 35;
+
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(key, fallback) {
+    try { const v = localStorage.getItem("pinceau." + key); return v === null ? fallback : JSON.parse(v); }
+    catch { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem("pinceau." + key, JSON.stringify(value)); } catch { /* private mode */ }
+  },
+};
+
+const state = {
+  strips: [],
+  strip: store.get("strip", null),
+  aimStyle: store.get("aimStyle", "top"),
+  mode: store.get("mode", "aim"),
+  color: store.get("color", COLORS[0]),
+  brush: store.get("brush", "color"),   // color | rainbow | eraser
+  size: store.get("size", 4),
+  fade: store.get("fade", 0),
+  tiltFlip: store.get("tiltFlip", false),
+  down: false,
+  slideX: null,
+  idle: false,
+};
+
+// ---------------------------------------------------------------- connection
+
+let socket = null;
+function connect() {
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(`${scheme}://${location.host}/api/phone`);
+  socket.onopen = () => $("dot").classList.add("on");
+  socket.onclose = () => { $("dot").classList.remove("on"); setTimeout(connect, 1000); };
+  socket.onmessage = (event) => {
+    let message;
+    try { message = JSON.parse(event.data); } catch { return; }
+    if (message.t === "idle" && message.v === state.strip) showIdle(true);
+  };
+}
+function send(message) {
+  // A slow network must not pile up stale positions
+  if (socket && socket.readyState === WebSocket.OPEN && socket.bufferedAmount < 2048) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+async function api(method, path, body) {
+  const response = await fetch(path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.status === "failed") {
+    throw new Error((data.payload && data.payload.reason) || `HTTP ${response.status}`);
+  }
+  return data;
+}
+
+// ---------------------------------------------------------------- sensors
+
+let orientation = null;   // {az, el} in degrees, where the phone points
+let tilt = null;          // left/right tilt in degrees, from gravity
+const samples = [];       // recent raw orientations, for calibration
+
+function aimVector(alpha, beta, gamma, style) {
+  // The device frame turned into the earth frame (W3C DeviceOrientation, Z-X'-Y'')
+  const d = Math.PI / 180;
+  const sA = Math.sin(alpha * d), cA = Math.cos(alpha * d);
+  const sB = Math.sin(beta * d), cB = Math.cos(beta * d);
+  const sG = Math.sin(gamma * d), cG = Math.cos(gamma * d);
+  if (style === "top") return [-cB * sA, cA * cB, sB];             // the device's +y axis
+  return [-(cG * sA * sB + cA * sG), -(sA * sG - cA * cG * sB), -cB * cG];  // its -z axis
+}
+
+// The gyroscope's yaw is smooth but drifts a little with every sweep, so the
+// aim slid further off the more the phone moved. The compass does not drift:
+// it slowly pulls the gyroscope back, and the aim stays where it was set.
+let absolute = null;   // {alpha, t}: Android's magnetometer-fused orientation
+let yawFix = null;     // degrees added to the gyroscope's alpha
+let lastFixAt = 0;
+function onAbsolute(event) {
+  if (event.alpha !== null) absolute = { alpha: event.alpha, t: performance.now() };
+}
+function compassAlpha(event, now) {
+  // iOS: compass heading, turning clockwise where alpha turns the other way
+  if (typeof event.webkitCompassHeading === "number" && event.webkitCompassAccuracy >= 0
+      && event.webkitCompassAccuracy <= 45) return 360 - event.webkitCompassHeading;
+  if (event.absolute === true) return event.alpha;
+  if (absolute && now - absolute.t < 250) return absolute.alpha;
+  return null;
+}
+const compassActive = () => yawFix !== null && performance.now() - lastFixAt < 1000;
+
+function onOrientation(event) {
+  if (event.alpha === null || event.beta === null || event.gamma === null) return;
+  const now = performance.now();
+  let alpha = event.alpha;
+  const reference = compassAlpha(event, now);
+  if (reference !== null) {
+    if (yawFix === null) yawFix = wrap(reference - alpha);
+    else {
+      const dt = Math.min(0.2, (now - lastFixAt) / 1000);
+      yawFix += wrap(reference - alpha - yawFix) * dt / DRIFT_SECONDS;
+    }
+    lastFixAt = now;
+  }
+  if (yawFix !== null) alpha += yawFix;
+  const [x, y, z] = aimVector(alpha, event.beta, event.gamma, state.aimStyle);
+  orientation = {
+    az: Math.atan2(x, y) * 180 / Math.PI,
+    el: Math.asin(Math.max(-1, Math.min(1, z))) * 180 / Math.PI,
+  };
+  samples.push({ t: now, ...orientation });
+  while (samples.length && now - samples[0].t > 1000) samples.shift();
+}
+
+function onMotion(event) {
+  const g = event.accelerationIncludingGravity;
+  if (!g || g.x === null) return;
+  const length = Math.hypot(g.x, g.y || 0, g.z || 0) || 9.81;
+  tilt = Math.asin(Math.max(-1, Math.min(1, g.x / length))) * 180 / Math.PI;
+}
+
+async function enableSensors() {
+  // iOS asks once, and only from a tap
+  for (const Kind of [window.DeviceOrientationEvent, window.DeviceMotionEvent]) {
+    if (Kind && typeof Kind.requestPermission === "function") {
+      try { await Kind.requestPermission(); } catch { /* refused: other modes still work */ }
+    }
+  }
+  window.addEventListener("deviceorientation", onOrientation);
+  window.addEventListener("deviceorientationabsolute", onAbsolute);
+  window.addEventListener("devicemotion", onMotion);
+}
+
+// One Euro filter: steady when the hand is still, quick when it sweeps
+class OneEuro {
+  constructor(minCutoff = 1.2, beta = 0.02, dCutoff = 1.0) {
+    Object.assign(this, { minCutoff, beta, dCutoff, x: null, dx: 0, t: 0 });
+  }
+  static alpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+  reset() { this.x = null; }
+  filter(value, t) {
+    if (this.x === null) { this.x = value; this.t = t; return value; }
+    const dt = Math.max((t - this.t) / 1000, 1e-3);
+    this.t = t;
+    const dx = (value - this.x) / dt;
+    this.dx += OneEuro.alpha(this.dCutoff, dt) * (dx - this.dx);
+    const cutoff = this.minCutoff + this.beta * Math.abs(this.dx);
+    this.x += OneEuro.alpha(cutoff, dt) * (value - this.x);
+    return this.x;
+  }
+}
+// A higher beta than the textbook value: the light must keep up with a sweep
+const smoother = new OneEuro(1.0, 0.08);
+
+// ---------------------------------------------------------------- calibration
+
+const wrap = (degrees) => ((degrees + 540) % 360) - 180;
+
+function interp(value, xs, ys) {
+  // Piecewise linear, carried on past both ends
+  const last = xs.length - 1;
+  let i = 0;
+  while (i < last - 1 && value > xs[i + 1]) i++;
+  const span = xs[i + 1] - xs[i] || 1e-6;
+  return ys[i] + (value - xs[i]) * (ys[i + 1] - ys[i]) / span;
+}
+
+let calibration = null;
+// v2: angles follow the compass now, so calibrations made before it do not fit
+const calibrationKey = () => `cal2.${state.strip}.${state.aimStyle}`;
+
+// When the finger last touched a capture button: the tap itself turns the phone a little
+let pressedAt = 0;
+const pressTime = () => {
+  const now = performance.now();
+  return now - pressedAt < 2000 ? pressedAt - 40 : now;
+};
+
+function heldAim(until = pressTime()) {
+  // The median of the 300 ms before the tap, unwrapped around its first sample
+  const recent = samples.filter((s) => s.t <= until && until - s.t < 300);
+  if (recent.length < 3) return null;
+  const median = (list) => { const s = [...list].sort((a, b) => a - b); return s[s.length >> 1]; };
+  const first = recent[0].az;
+  return { az: median(recent.map((s) => first + wrap(s.az - first))), el: median(recent.map((s) => s.el)) };
+}
+
+const cal = { points: [], positions: [] };
+function startCalibration(count) {
+  cal.positions = count === 5 ? [0, 0.25, 0.5, 0.75, 1] : [0, 0.5, 1];
+  cal.points = [];
+  show("calibrate");
+  showCalibrationStep();
+}
+function showCalibrationStep() {
+  const step = cal.points.length;
+  const x = cal.positions[step];
+  $("cal-step").textContent = `${step + 1} / ${cal.positions.length}`;
+  $("cal-text").textContent = x === 0 ? "Vise le DÉBUT du ruban (le point qui clignote)"
+    : x === 1 ? "Vise la FIN du ruban (le point qui clignote)"
+    : "Vise le point qui clignote sur le ruban";
+  $("cal-note").textContent = orientation ? "Garde le téléphone immobile, puis touche Valider."
+    : "Aucun capteur d'orientation : utilise le mode Incliner ou Glisser.";
+  send({ t: "mark", v: state.strip, x });
+}
+function captureCalibration() {
+  const aim = heldAim();
+  if (!aim) { $("cal-note").textContent = "Capteurs muets : bouge un peu le téléphone et réessaie."; return; }
+  cal.points.push(aim);
+  if (cal.points.length < cal.positions.length) { showCalibrationStep(); return; }
+  send({ t: "mark", v: state.strip, x: null });
+  const result = buildCalibration(cal.points, cal.positions);
+  if (typeof result === "string") {
+    $("cal-note").textContent = result;
+    cal.points = [];
+    setTimeout(showCalibrationStep, 1800);
+    return;
+  }
+  calibration = result;
+  store.set(calibrationKey(), calibration);
+  smoother.reset();
+  setMode("aim");
+  show("paint");
+}
+function buildCalibration(points, positions) {
+  // Follow azimuth for a level strip and elevation for an upright one
+  const az = [points[0].az];
+  for (let i = 1; i < points.length; i++) az.push(az[i - 1] + wrap(points[i].az - az[i - 1]));
+  const el = points.map((p) => p.el);
+  const spread = (list) => Math.abs(list[list.length - 1] - list[0]);
+  const axis = spread(az) >= spread(el) ? "az" : "el";
+  let angles = axis === "az" ? az : el;
+  let order = [...positions];
+  if (spread(angles) < 6) return "Les points sont trop proches : recule ou vise mieux les extrémités.";
+  const rising = angles[angles.length - 1] > angles[0];
+  for (let i = 1; i < angles.length; i++) {
+    if ((angles[i] > angles[i - 1]) !== rising) return "Les points ne sont pas dans l'ordre : recommence en visant bien chaque point.";
+  }
+  if (!rising) { angles = [...angles].reverse(); order = order.reverse(); }
+  return { axis, angles, positions: order };
+}
+
+function aimedX() {
+  if (!calibration || !orientation) return null;
+  const { axis, angles, positions } = calibration;
+  let angle = orientation[axis];
+  if (axis === "az") {
+    const middle = (angles[0] + angles[angles.length - 1]) / 2;
+    angle = middle + wrap(angle - middle);
+  }
+  angle = smoother.filter(angle, performance.now());
+  return interp(angle, angles, positions);
+}
+
+// Recentre: aim at the middle again to take out the drift of the gyroscope
+let recentering = false;
+function recenter() {
+  if (!calibration) return;
+  recentering = !recentering;
+  $("recenter").textContent = recentering ? "Vise le point, touche ici" : "Recentrer";
+  if (recentering) { send({ t: "mark", v: state.strip, x: 0.5 }); return; }
+  send({ t: "mark", v: state.strip, x: null });
+  const aim = heldAim();
+  if (!aim) return;
+  const { axis, angles, positions } = calibration;
+  const middle = (angles[0] + angles[angles.length - 1]) / 2;
+  let now = aim[axis];
+  if (axis === "az") now = middle + wrap(now - middle);
+  // positions run backwards when the strip was calibrated right to left
+  const pairs = positions.map((p, i) => [p, angles[i]]).sort((a, b) => a[0] - b[0]);
+  const shift = now - interp(0.5, pairs.map((p) => p[0]), pairs.map((p) => p[1]));
+  calibration.angles = angles.map((a) => a + shift);
+  store.set(calibrationKey(), calibration);
+  smoother.reset();
+}
+
+// ---------------------------------------------------------------- painting loop
+
+// Fine correction of the aim, in LEDs toward the end of the strip, kept per strip
+// v2: offsets set to make up for the drift are not wanted once it is gone
+const offsetKey = () => `offset2.${state.strip}`;
+function stripPixels() {
+  const strip = state.strips.find((s) => s.id === state.strip);
+  return strip ? strip.pixels : 100;
+}
+function leftIsStart() {
+  // A level strip calibrated in Viser tells which of its ends is on the left
+  if (state.mode === "aim" && calibration && calibration.axis === "az") {
+    const p = calibration.positions;
+    return p[0] < p[p.length - 1];
+  }
+  return true;
+}
+function nudge(direction) {
+  // direction is -1 for ◀ and +1 for ▶, as the user sees the strip
+  const step = leftIsStart() ? direction : -direction;
+  store.set(offsetKey(), store.get(offsetKey(), 0) + step);
+  showNudge();
+}
+function showNudge() {
+  const leds = store.get(offsetKey(), 0);
+  const side = state.mode === "aim" && calibration && calibration.axis === "az"
+    ? ((leds > 0) === leftIsStart() ? "la droite" : "la gauche")
+    : (leds > 0 ? "la fin" : "le début");
+  $("nudge-out").textContent = leds === 0 ? "Décalage : aucun"
+    : `Décalage : ${Math.abs(leds)} LED vers ${side}`;
+}
+
+function pointerX() {
+  let x = null;
+  if (state.mode === "aim") x = aimedX();
+  else if (state.mode === "tilt" && tilt !== null) {
+    x = 0.5 + (state.tiltFlip ? -tilt : tilt) / (2 * TILT_RANGE);
+  } else if (state.mode === "slide") x = state.slideX;
+  if (x !== null && state.mode !== "slide") {
+    x += store.get(offsetKey(), 0) / Math.max(1, stripPixels() - 1);
+  }
+  if (x === null || x < -OFF_STRIP || x > 1 + OFF_STRIP) return null;
+  return Math.min(1, Math.max(0, x));
+}
+
+function hsvHex(h) {
+  const f = (n) => { const k = (n + h * 6) % 6; return Math.round(255 * (1 - Math.max(0, Math.min(k, 4 - k, 1)))); };
+  return "#" + [f(5), f(3), f(1)].map((v) => v.toString(16).padStart(2, "0")).join("");
+}
+function brushColor(now) {
+  if (state.brush === "rainbow") return hsvHex((now / 4000) % 1);
+  return state.color;
+}
+
+let lastKey = "", lastSent = 0;
+function tick(now) {
+  requestAnimationFrame(tick);
+  if (!$("paint").classList.contains("shown") || document.hidden || !state.strip) return;
+  const x = pointerX();
+  const down = state.mode === "slide" ? state.slideX !== null : state.down;
+  const message = {
+    t: "p", v: state.strip, x: x === null ? null : Math.round(x * 10000) / 10000,
+    d: down && x !== null, c: brushColor(now), s: state.size / 100, e: state.brush === "eraser",
+  };
+  const key = JSON.stringify(message);
+  if (key !== lastKey || now - lastSent > KEEPALIVE_MS) {
+    send(message);
+    lastKey = key;
+    lastSent = now;
+  }
+  drawBar(x, message.c, down);
+  const drift = state.mode !== "aim" ? ""
+    : compassActive() ? "Anti-dérive : boussole active"
+    : "Anti-dérive : boussole indisponible, touche Recentrer si la visée glisse";
+  if ($("drift").textContent !== drift) $("drift").textContent = drift;
+  document.documentElement.style.setProperty("--brush", state.brush === "eraser" ? "#666" : message.c);
+}
+
+function drawBar(x, color, down) {
+  const canvas = $("bar-canvas");
+  const ratio = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth * ratio, height = canvas.clientHeight * ratio;
+  if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; }
+  const g = canvas.getContext("2d");
+  g.clearRect(0, 0, width, height);
+  g.fillStyle = "#1b1f2b";
+  for (let i = 0; i < 60; i++) g.fillRect((i + 0.5) * width / 60 - ratio, height / 2 - ratio, 2 * ratio, 2 * ratio);
+  if (x === null) return;
+  const cx = x * width, r = Math.max(4 * ratio, state.size / 100 * width / 2);
+  g.fillStyle = state.brush === "eraser" ? "#fff" : color;
+  g.globalAlpha = down ? 1 : 0.55;
+  g.beginPath();
+  g.roundRect ? g.roundRect(cx - r, height * 0.2, 2 * r, height * 0.6, r) : g.rect(cx - r, height * 0.2, 2 * r, height * 0.6);
+  g.fill();
+  g.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------- screens
+
+function show(id) {
+  for (const s of document.querySelectorAll("section")) s.classList.toggle("shown", s.id === id);
+  window.scrollTo(0, 0);
+}
+function showIdle(on) {
+  state.idle = on;
+  $("idle").classList.toggle("shown", on);
+}
+
+function pick(groupId, value) {
+  for (const b of $(groupId).querySelectorAll("button")) b.classList.toggle("picked", b.dataset.v === value);
+}
+
+const MODE_NOTES = {
+  aim: "Pointe le téléphone vers le ruban et garde PEINDRE enfoncé.",
+  tilt: "Penche le téléphone à gauche ou à droite, sans calibration.",
+  slide: "Glisse le doigt sur la barre : elle représente le ruban.",
+};
+function setMode(mode) {
+  if (mode === "aim" && !calibration) { startCalibration(3); return; }
+  state.mode = mode;
+  store.set("mode", mode);
+  pick("mode", mode);
+  $("mode-note").textContent = MODE_NOTES[mode] + (mode === "tilt" ? " Touche la barre pour inverser le sens." : "");
+  $("bar-hint").textContent = mode === "slide" ? "Glisse ici" : "";
+  $("paint-btn").hidden = mode === "slide";
+  $("nudge").hidden = mode === "slide";
+  showNudge();
+  smoother.reset();
+}
+
+function renderStrips() {
+  const list = $("strips");
+  list.textContent = "";
+  for (const strip of state.strips) {
+    const row = document.createElement("div");
+    row.className = "strip" + (strip.id === state.strip ? " picked" : "");
+    const name = document.createElement("b");
+    name.textContent = strip.name;
+    const info = document.createElement("small");
+    info.textContent = `${strip.pixels} LED` + (strip.active ? "" : " · éteint");
+    row.append(name, info);
+    row.onclick = () => { state.strip = strip.id; store.set("strip", strip.id); renderStrips(); };
+    list.append(row);
+  }
+  $("start").disabled = !state.strips.some((s) => s.id === state.strip);
+}
+
+function renderPalette() {
+  const palette = $("palette");
+  palette.textContent = "";
+  const add = (className, title, onPick, picked, color) => {
+    const b = document.createElement("button");
+    b.className = "swatch " + className + (picked ? " picked" : "");
+    b.title = title;
+    if (color) b.style.background = color;
+    b.onclick = onPick;
+    palette.append(b);
+    return b;
+  };
+  for (const color of COLORS) {
+    add("", color, () => { state.color = color; state.brush = "color"; savePalette(); },
+      state.brush === "color" && state.color === color, color);
+  }
+  add("rainbow", "Arc-en-ciel", () => { state.brush = "rainbow"; savePalette(); }, state.brush === "rainbow");
+  add("eraser", "Gomme", () => { state.brush = "eraser"; savePalette(); }, state.brush === "eraser");
+  const custom = add("custom", "Autre couleur", null,
+    state.brush === "color" && !COLORS.includes(state.color), COLORS.includes(state.color) ? null : state.color);
+  const input = document.createElement("input");
+  input.type = "color";
+  input.value = state.color;
+  input.oninput = () => { state.color = input.value; state.brush = "color"; savePalette(); };
+  custom.append(input);
+}
+function savePalette() {
+  store.set("color", state.color);
+  store.set("brush", state.brush);
+  renderPalette();
+}
+
+function showSliders() {
+  $("size").value = state.size;
+  $("size-out").textContent = `${state.size} %`;
+  $("fade").value = state.fade;
+  $("fade-out").textContent = state.fade === 0 ? "permanente" : `${state.fade} s`;
+}
+
+// ---------------------------------------------------------------- strip control
+
+async function takeStrip() {
+  const id = state.strip;
+  const strip = state.strips.find((s) => s.id === id);
+  // Remember what was running, to put it back when the painting is done
+  const current = await api("GET", `/api/virtuals/${encodeURIComponent(id)}/effects`);
+  if (current.effect && current.effect.type && current.effect.type !== EFFECT) {
+    store.set(`previous.${id}`, { type: current.effect.type, config: current.effect.config });
+  } else if (!current.effect || !current.effect.type) {
+    store.set(`previous.${id}`, null);
+  }
+  await api("POST", `/api/virtuals/${encodeURIComponent(id)}/effects`, { type: EFFECT });
+  await setFade(state.fade);
+  if (strip && !strip.active) {
+    await api("PUT", `/api/virtuals/${encodeURIComponent(id)}`, { active: true });
+    strip.active = true;
+  }
+  showIdle(false);
+}
+
+async function releaseStrip() {
+  const id = state.strip;
+  const previous = store.get(`previous.${id}`, null);
+  send({ t: "mark", v: id, x: null });
+  if (previous) await api("POST", `/api/virtuals/${encodeURIComponent(id)}/effects`, previous);
+  else await api("DELETE", `/api/virtuals/${encodeURIComponent(id)}/effects`);
+}
+
+let fadeTimer = null;
+function setFade(value) {
+  return api("PUT", `/api/virtuals/${encodeURIComponent(state.strip)}/effects`,
+    { type: EFFECT, config: { fade: value } }).catch(() => {});
+}
+
+// ---------------------------------------------------------------- wake lock
+
+let wakeLock = null;
+async function keepAwake() {
+  try { if ("wakeLock" in navigator && !wakeLock) wakeLock = await navigator.wakeLock.request("screen"); }
+  catch { /* not allowed: the screen may sleep */ }
+  if (wakeLock) wakeLock.addEventListener("release", () => { wakeLock = null; }, { once: true });
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && $("paint").classList.contains("shown")) keepAwake();
+});
+
+// ---------------------------------------------------------------- wiring
+
+function holdButton(element, onChange) {
+  element.addEventListener("pointerdown", (e) => { e.preventDefault(); element.setPointerCapture(e.pointerId); onChange(true); });
+  for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) {
+    element.addEventListener(type, () => onChange(false));
+  }
+  element.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+
+function wire() {
+  for (const b of $("aim-style").querySelectorAll("button")) {
+    b.onclick = () => { state.aimStyle = b.dataset.v; store.set("aimStyle", state.aimStyle); pick("aim-style", state.aimStyle); };
+  }
+  pick("aim-style", state.aimStyle);
+
+  $("start").onclick = async () => {
+    $("start").disabled = true;
+    try {
+      await enableSensors();
+      await takeStrip();
+      calibration = store.get(calibrationKey(), null);
+      keepAwake();
+      if (state.mode === "aim" && !calibration) startCalibration(3);
+      else { setMode(state.mode); show("paint"); }
+    } catch (error) {
+      alert("Impossible de prendre le ruban : " + error.message);
+    } finally {
+      $("start").disabled = false;
+    }
+  };
+
+  for (const id of ["cal-ok", "recenter"]) {
+    $(id).addEventListener("pointerdown", () => { pressedAt = performance.now(); });
+  }
+  $("cal-ok").onclick = captureCalibration;
+  $("nudge-left").onclick = () => nudge(-1);
+  $("nudge-right").onclick = () => nudge(1);
+  $("cal-precise").onclick = () => startCalibration(5);
+  $("cal-cancel").onclick = () => {
+    send({ t: "mark", v: state.strip, x: null });
+    setMode(calibration ? "aim" : "slide");
+    show("paint");
+  };
+
+  for (const b of $("mode").querySelectorAll("button")) b.onclick = () => setMode(b.dataset.v);
+
+  holdButton($("paint-btn"), (down) => {
+    state.down = down;
+    $("paint-btn").classList.toggle("down", down);
+  });
+
+  const bar = $("bar");
+  const slideAt = (e) => {
+    const rect = bar.getBoundingClientRect();
+    state.slideX = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+  };
+  bar.addEventListener("pointerdown", (e) => {
+    if (state.mode === "tilt") {
+      state.tiltFlip = !state.tiltFlip;
+      store.set("tiltFlip", state.tiltFlip);
+      return;
+    }
+    if (state.mode !== "slide") return;
+    e.preventDefault();
+    bar.setPointerCapture(e.pointerId);
+    slideAt(e);
+  });
+  bar.addEventListener("pointermove", (e) => { if (state.mode === "slide" && state.slideX !== null) slideAt(e); });
+  for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) {
+    bar.addEventListener(type, () => { state.slideX = null; });
+  }
+
+  $("size").oninput = () => { state.size = Number($("size").value); store.set("size", state.size); showSliders(); };
+  $("fade").oninput = () => {
+    state.fade = Number($("fade").value);
+    store.set("fade", state.fade);
+    showSliders();
+    clearTimeout(fadeTimer);
+    fadeTimer = setTimeout(() => setFade(state.fade), 250);
+  };
+
+  $("clear").onclick = () => send({ t: "clear", v: state.strip });
+  $("fill").onclick = () => send({ t: "fill", v: state.strip, c: state.brush === "eraser" ? "#000000" : brushColor(performance.now()) });
+  $("recenter").onclick = recenter;
+  $("recalibrate").onclick = () => startCalibration(3);
+  $("retake").onclick = () => takeStrip().catch((e) => alert(e.message));
+  $("finish").onclick = async () => {
+    try { await releaseStrip(); } catch (error) { alert("Impossible de remettre l'effet : " + error.message); }
+    show("setup");
+    loadStrips();
+  };
+}
+
+async function loadStrips() {
+  try {
+    const status = await api("GET", "/api/phone");
+    state.strips = status.virtuals;
+    renderStrips();
+    const phone = !!window.DeviceOrientationEvent && ("ontouchstart" in window);
+    if (!window.isSecureContext) {
+      $("insecure").hidden = false;
+      if (status.phone_url) {
+        const text = $("insecure-text");
+        text.textContent = "Ouvre plutôt : ";
+        const link = document.createElement("a");
+        link.href = status.phone_url;
+        link.textContent = status.phone_url;
+        text.append(link);
+      }
+    }
+    if (!phone && status.phone_url) {
+      $("desktop").hidden = false;
+      $("desktop-url").textContent = status.phone_url;
+    }
+  } catch (error) {
+    $("strips").textContent = "LedFx ne répond pas : " + error.message;
+  }
+}
+
+wire();
+renderPalette();
+showSliders();
+connect();
+loadStrips();
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>

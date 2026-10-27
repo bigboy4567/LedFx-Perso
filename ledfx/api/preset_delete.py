@@ -1,0 +1,55 @@
+import logging
+
+from aiohttp import web
+
+from ledfx.api import RestEndpoint
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class PresetDeleteEndpoint(RestEndpoint):
+    """REST end-point for deleting user presets"""
+
+    ENDPOINT_PATH = "/api/effects/{effect_id}/presets/{preset_id}"
+
+    async def delete(self, effect_id, preset_id) -> web.Response:
+        """Delete a user preset.
+
+        Args:
+            effect_id (str): The ID of the effect.
+            preset_id (str): The ID of the preset to delete.
+
+        Returns:
+            web.Response: The HTTP response object.
+        """
+        # Validate effect exists
+        try:
+            self._ledfx.effects.get_class(effect_id)
+        except KeyError:
+            error_message = f"Effect {effect_id} does not exist"
+            _LOGGER.warning(error_message)
+            return await self.invalid_request(error_message)
+
+        # Check if effect has any user presets
+        user_presets = self._ledfx.config.user_presets
+        if effect_id not in user_presets:
+            return await self.invalid_request(f"Effect {effect_id} has no user presets")
+
+        # Check if preset exists
+        if preset_id not in user_presets[effect_id]:
+            return await self.invalid_request(
+                f"Preset {preset_id} does not exist for effect {effect_id} in user presets"
+            )
+
+        # Delete the preset from configuration
+        try:
+            del user_presets[effect_id][preset_id]
+
+            # Save the config
+            self._ledfx.config_store.request_save()
+        except Exception as e:  # noqa: BLE001
+            error_message = f"Failed to delete preset {preset_id}: {e!s}"
+            _LOGGER.warning(error_message)
+            return await self.invalid_request(error_message)
+
+        return await self.request_success()

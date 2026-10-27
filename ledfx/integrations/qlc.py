@@ -1,0 +1,387 @@
+import asyncio
+
+# import numpy as np
+# import importlib
+# import pkgutil
+import logging
+from collections.abc import Callable
+from typing import ClassVar
+
+import aiohttp
+from pydantic import Field
+
+from ledfx.configuration.fields import X_REQUIRED, CoercedInt
+from ledfx.configuration.plugin import PluginConfig, TypedConfig
+
+# from ledfx.events import Event
+from ledfx.integrations import Integration, Status
+from ledfx.utils import async_fire_and_forget, resolve_destination
+
+# import time
+# import os
+# import re
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class QLC(Integration):
+    """QLC+ Integration"""
+
+    beta = False
+
+    _widget_types: ClassVar[list[str]] = ["Button", "Slider", "Audio Triggers"]
+    NAME = "QLC+"
+    DESCRIPTION = "Web Api Integration for Q Light Controller Plus"
+
+    class Config(PluginConfig):
+        name: str = Field(
+            "QLC+",
+            description="Name of this integration instance and associated settings",
+            json_schema_extra={X_REQUIRED: True},
+        )
+        description: str = Field(
+            "Web Api Integration for Q Light Controller Plus",
+            description="Description of this integration",
+            json_schema_extra={X_REQUIRED: True},
+        )
+        ip_address: str = Field(
+            "127.0.0.1",
+            description="QLC+ ip address",
+            json_schema_extra={X_REQUIRED: True},
+        )
+        port: CoercedInt = Field(
+            9999,
+            description="QLC+ port",
+            ge=1,
+            le=65535,
+            json_schema_extra={X_REQUIRED: True},
+        )
+
+    config = TypedConfig(Config)
+
+    def __init__(self, ledfx, config, active, data):
+        super().__init__(ledfx, config, active, data)
+
+        self._ledfx = ledfx
+        self._config = config
+        self._client = None
+        self._data = []
+        self._listeners = []
+        self._connect_task = None
+        # Bumped by every connect and disconnect: a connect that resumes after
+        # a newer one started, or after a disconnect, gives up.
+        self._connect_generation = 0
+
+        self.restore_from_data(data)
+
+    def restore_from_data(self, data):
+        """Creates the event listeners from saved data"""
+        if data is not None:
+            try:
+                for entry in data:
+                    event_type, event_filter, active, qlc_payload = entry
+                    self.create_event(event_type, event_filter, active, qlc_payload)
+            except ValueError:
+                _LOGGER.error("Failed to restore QLC+ settings")
+
+    def get_events(self):
+        """Get all events in data:
+        [(event_type, event_filter, active, qlc_payload), ...]
+        event_type : type of event, str
+        event_filter : filter for event, dict eg. {"effect_name": "Scroll"}
+        active : whether there is an active listener for this event
+        qlc_payload : the payload that is sent when this event is triggered
+        """
+        return self._data
+
+    def event_exists(self, event_type, event_filter):
+        """
+        Check if an event with the specified event_type and event_filter exists.
+
+        Parameters:
+        event_type (str): The type of the event.
+        event_filter (str): The filter for the event.
+
+        Returns:
+        bool: True if an event with the specified event_type and event_filter exists, False otherwise.
+        """
+        for entry in self._data:
+            _event_type, _event_filter, _active, _qlc_payload = entry
+            if (_event_type == event_type) and (_event_filter == event_filter):
+                return True
+        return False
+
+    def create_event(self, event_type, event_filter, active, qlc_payload):
+        """Create or update event listener that sends a qlc payload on a specific event"""
+        # If it exists, remove the existing listener and update data
+        for idx, entry in enumerate(self._data):
+            _event_type, _event_filter, _active, _qlc_payload = entry
+            if (_event_type == event_type) and (_event_filter == event_filter):
+                self._data[idx] = [
+                    event_type,
+                    event_filter,
+                    active,
+                    qlc_payload,
+                ]
+                # if it was active, remove existing listener
+                if _active:
+                    self._remove_listener(_event_type, event_filter)
+                break
+        # If it doesn't already exist, add it as a new entry to data
+        else:
+            self.data.append([event_type, event_filter, active, qlc_payload])
+        # Finally, subscribe to the ledfx event if the listener is now active
+        if active:
+            self._add_listener(event_type, event_filter, qlc_payload)
+        _LOGGER.info(
+            "QLC+ payload linked to event '%s' with filter %s",
+            event_type,
+            event_filter,
+        )
+
+    def delete_event(self, event_type, event_filter):
+        """Completely delete event listener and saved payload from data"""
+        # remove listener if it exists
+        self._remove_listener(event_type, event_filter)
+        # remove event and payload from data
+        for idx, entry in enumerate(self._data):
+            _event_type, _event_filter, _active, _qlc_payload = entry
+            if (_event_type == event_type) and (_event_filter == event_filter):
+                del self._data[idx]
+        _LOGGER.info(
+            "QLC+ payload deleted for event '%s' with filter %s",
+            event_type,
+            event_filter,
+        )
+
+    def toggle_event(self, event_type, event_filter):
+        """Toggle a payload linked to event on or off"""
+        # Update "active" flag in data
+        for idx, entry in enumerate(self._data):
+            _event_type, _event_filter, _active, _qlc_payload = entry
+            if (_event_type == event_type) and (_event_filter == event_filter):
+                # toggle active flag in data
+                self._data[idx] = [
+                    event_type,
+                    event_filter,
+                    not _active,
+                    _qlc_payload,
+                ]
+                # Enable/disable listener
+                if _active:
+                    self._remove_listener(_event_type, event_filter)
+                else:
+                    # no listener exists, so create it
+                    self._add_listener(event_type, event_filter, _qlc_payload)
+                # log action
+                _LOGGER.info(
+                    "QLC+ payload %s for event '%s' with filter %s",
+                    "disabled" if _active else "enabled",
+                    event_type,
+                    event_filter,
+                )
+                return True  # success
+        return False  # failed to find event_type with this event_filter
+
+    def _remove_listener(self, event_type, event_filter):
+        """Internal function to remove ledfx events listener if it exists"""
+        for idx, entry in enumerate(self._listeners):
+            _event_type, _event_filter, listener = entry
+            if (_event_type == event_type) and (_event_filter == event_filter):
+                # Call the listener function that removes the listener
+                listener()
+                del self._listeners[idx]
+                break
+
+    def _add_listener(self, event_type, event_filter, qlc_payload):
+        """Internal function that links payload to send on the specified event"""
+
+        def make_callback(qlc_payload):
+            def callback(_):
+                _LOGGER.info(
+                    "QLC+ sent payload, triggered by event '%s' with filter %s",
+                    event_type,
+                    event_filter,
+                )
+                async_fire_and_forget(
+                    self._send_payload(qlc_payload), loop=self._ledfx.loop
+                )
+
+            return callback
+
+        callback = make_callback(qlc_payload)
+        listener = self._ledfx.events.add_listener(callback, event_type, event_filter)
+        # store "listener", a function to remove the listener later if needed
+        self._listeners.append((event_type, event_filter, listener))
+
+    async def get_widgets(self):
+        """Returns a list of widgets as tuples: [(ID, Type, Name),...]"""
+        # First get list of widgets (ID, Name)
+        widgets: list[tuple[str, str, str]] = []
+        client = self._client
+        if client is None:
+            return widgets
+        # query() already strips the "QLC+API|" prefix from responses.
+        response = await client.query("QLC+API|getWidgetsList")
+        widgets_list = response.removeprefix("getWidgetsList|").split("|")
+        # Then get the type for each widget (in individual requests bc QLC api be like that)
+        for widget_id, widget_name in zip(widgets_list[::2], widgets_list[1::2]):
+            if self._client is not client:  # disconnected meanwhile
+                widgets.clear()
+                break
+            response = await client.query(f"QLC+API|getWidgetType|{widget_id}")
+            widget_type = response.removeprefix("getWidgetType|")
+            if widget_type in self._widget_types:
+                widgets.append((widget_id, widget_type, widget_name))
+        return widgets
+
+    async def _send_payload(self, qlc_payload):
+        """Sends payload of {id:value, ...} pairs to QLC"""
+        client = self._client
+        for widget_id, value in qlc_payload.items():
+            if client is None or self._client is not client:
+                return
+            await client.send(f"{int(widget_id)}|{value}")
+
+    async def connect(self):
+        self._connect_generation += 1
+        generation = self._connect_generation
+        try:
+            resolved_ip = await resolve_destination(
+                self._ledfx.loop,
+                self._ledfx.thread_executor,
+                self.config.ip_address,
+            )
+        except ValueError as e:
+            # A host that does not resolve is a config error: report it and
+            # stop, rather than staying on "connecting".
+            # A newer attempt may have connected meanwhile; leave its status.
+            if generation == self._connect_generation:
+                _LOGGER.warning("QLC+ %s: %s", self.name, e)
+                await super().disconnect()
+            return
+        if generation != self._connect_generation:
+            return
+        domain = f"{resolved_ip}:{self.config.port}"
+        url = f"http://{domain}/qlcplusWS"
+        if self._client is None:
+            self._client = QLCWebsocketClient(url, domain)
+        self._cancel_connect()
+        self._connect_task = asyncio.create_task(self._client.connect())
+        if await self._connect_task and generation == self._connect_generation:
+            await super().connect(f"Connected to QLC+ websocket at {domain}")
+
+    async def disconnect(self):
+        self._connect_generation += 1
+        self._cancel_connect()
+        # Swapped out before the await, so in-flight operations see it gone.
+        client, self._client = self._client, None
+        if client is not None:
+            # Bounded by the websocket close timeout; the session is closed
+            # by the time this returns, so delete and update can't leak it.
+            await client.disconnect()
+            await super().disconnect("Disconnected from QLC+ websocket")
+        else:
+            await super().disconnect()
+
+    async def deactivate(self):
+        # The base class fires disconnect() and forgets it, but an update
+        # destroys this integration straight after deactivating it.
+        _LOGGER.info("Deactivating %s integration", self.name)
+        self._active = False
+        self._status = Status.DISCONNECTING
+        await self.disconnect()
+
+    async def on_delete(self):
+        await self.disconnect()
+
+    def _cancel_connect(self):
+        if self._connect_task is not None:
+            self._connect_task.cancel()
+            self._connect_task = None
+
+
+class QLCWebsocketClient:
+    def __init__(self, url, domain):
+        super().__init__()
+        self.websocket = None
+        self.url = url
+        self.domain = domain
+        self.session = aiohttp.ClientSession()
+
+    async def connect(self):
+        """Connect to the WebSocket."""
+        while True:
+            try:
+                self.websocket = await self.session.ws_connect(self.url)
+                # self.websocket = await self.ws_connect(self.url)
+                return True
+            except aiohttp.ClientError as e:
+                _LOGGER.info(
+                    "Connection to %s failed (%s). Retrying in 5s...", self.domain, e
+                )
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                return False
+
+    async def disconnect(self):
+        try:
+            if self.websocket is not None:
+                # close() can wait on the transport indefinitely; the session
+                # must be closed either way.
+                async with asyncio.timeout(5):
+                    await self.websocket.close()
+        except TimeoutError:
+            _LOGGER.warning("Timed out closing the QLC+ websocket at %s", self.domain)
+        finally:
+            await self.session.close()
+
+    async def begin(self, callback):
+        """Connect and indefinitely read from websocket, returning messages to callback func"""
+        await self.connect()
+        await self.read(callback)
+
+    async def query(self, message):
+        """Send a message, and return the response"""
+        await self.send(message)
+        result = await self.receive()
+        if result is None:
+            return ""
+        return result.removeprefix("QLC+API|")
+
+    async def send(self, message):
+        """Send a message to the WebSocket."""
+        if self.websocket is None:
+            _LOGGER.error("Websocket not yet established")
+            return
+
+        await self.websocket.send_str(message)
+        # Every call to the logger is a performance hit
+        _LOGGER.debug("Sent message %s to %s", message, self.domain)
+
+    async def receive(self):
+        """Receive one message from the WebSocket."""
+        if self.websocket is None:
+            _LOGGER.error("Websocket not yet established")
+            return
+
+        return (await self.websocket.receive()).data
+
+    async def read(self, callback: Callable[[aiohttp.WSMessage], None]) -> None:
+        """Read messages from the WebSocket."""
+        websocket = self.websocket
+        if websocket is None:
+            _LOGGER.error("Websocket not yet established")
+            return
+
+        while True:
+            message = await websocket.receive()
+            if message.type == aiohttp.WSMsgType.TEXT:
+                callback(message)
+            elif message.type in (
+                aiohttp.WSMsgType.CLOSE,
+                aiohttp.WSMsgType.CLOSING,
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.ERROR,
+            ):
+                break

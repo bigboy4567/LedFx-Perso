@@ -1,0 +1,1245 @@
+import asyncio
+import binascii
+import inspect
+import json
+import logging
+import struct
+import time
+import uuid
+from collections.abc import Callable, Mapping
+from concurrent import futures
+from typing import Annotated, ClassVar, Literal, get_args
+
+import numpy as np
+import pybase64
+from aiohttp import WSMsgType, web
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from ledfx.api import RestEndpoint
+from ledfx.api.jsonutil import default, dumps
+from ledfx.configuration.fields import coerce
+from ledfx.events import (
+    ClientBroadcastEvent,
+    ClientConnectedEvent,
+    ClientDisconnectedEvent,
+    ClientsUpdatedEvent,
+    Event,
+    FrontendVisualiserDataEvent,
+    SongDetectedEvent,
+)
+
+_LOGGER = logging.getLogger(__name__)
+MAX_PENDING_MESSAGES = 256
+FINAL_ERROR_REPLY_TIMEOUT = 1.0
+MAX_VAL = 32767
+
+# Phase 2: Client metadata constants
+VALID_CLIENT_TYPES = [
+    "controller",
+    "visualiser",
+    "mobile",
+    "display",
+    "api",
+    "not-set",
+    "unknown",
+]
+
+# Phase 3: Broadcasting constants and message models
+BroadcastType = Literal["visualiser_control", "scene_sync", "color_palette", "custom"]
+TargetMode = Literal["all", "type", "names", "uuids"]
+BROADCAST_TYPES: list[str] = list(get_args(BroadcastType))
+TARGET_MODES: list[str] = list(get_args(TargetMode))
+MAX_PAYLOAD_SIZE = 2048
+NonEmptyStr = Annotated[str, Field(min_length=1)]
+
+
+class BaseMessage(BaseModel):
+    """Every websocket message: an int id (coerced, as before) and a type."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: Annotated[int, coerce(int)]
+    type: str
+
+
+class BroadcastTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: TargetMode
+    value: str | None = None  # For mode="type"
+    names: list[NonEmptyStr] | None = None  # For mode="names"
+    uuids: list[NonEmptyStr] | None = None  # For mode="uuids"
+
+
+class BroadcastData(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    broadcast_type: BroadcastType
+    target: BroadcastTarget
+    payload: dict[str, object]
+
+
+# Not all events are able to be subscribed to by the websocket
+# This dict show the events that are not subscribable and what event should be used instead
+NON_SUBSCRIBABLE_EVENTS = {
+    "device_update": "visualisation_update",
+    "virtual_update": "visualisation_update",
+}
+
+# TODO: Have a more well defined registration and a more componetized solution.
+# Could do something like have Device actually provide the handler for Device
+# related functionality. This would allow easy access to internal workings and
+# events.
+websocket_handlers = {}
+
+
+def websocket_handler(type):
+    def function(func):
+        websocket_handlers[type] = func
+        return func
+
+    return function
+
+
+WEB_AUDIO_CLIENTS = set()
+ACTIVE_AUDIO_STREAM = None
+
+
+class WebsocketEndpoint(RestEndpoint):
+    ENDPOINT_PATH = "/api/websocket"
+
+    async def get(self, request) -> web.Response:
+        try:
+            return await WebsocketConnection(self._ledfx).handle(request)
+        except ConnectionResetError:
+            _LOGGER.debug("Connection Reset Error on Websocket Connection.")
+            return await self.internal_error("Connection Reset Error.")
+
+
+class WebsocketConnection:
+    ip_uid_map: ClassVar[dict[str, str]] = {}
+    map_lock = asyncio.Lock()
+    # Phase 1: Class-level metadata storage
+    client_metadata: ClassVar[
+        dict[str, dict[str, object]]
+    ] = {}  # UUID -> metadata dict
+    metadata_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
+
+    def __init__(self, ledfx):
+        self._ledfx = ledfx
+        self._socket = None
+        self._listeners: dict[object, Callable[[], None]] = {}
+        self._receiver_task = None
+        self._sender_task: asyncio.Task[None] | None = None
+        self._receiver_error_reply: dict[str, object] | None = None
+        # Dual-path sender: control queue for reliable ordered messages,
+        # single-slot mailbox dict for latest-value-wins vis frames.
+        self._control_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue(
+            maxsize=MAX_PENDING_MESSAGES
+        )
+        self._closed = False
+        self._installation_reply_failed = False
+        self._installation_close_task: asyncio.Task[None] | None = None
+        self._vis_slots: dict[
+            object, dict[str, object]
+        ] = {}  # vis_id -> latest message (overwrites old)
+        self._has_work = asyncio.Event()
+        self.client_ip = None
+        self.uid = None
+        # Phase 1: Instance attributes for client metadata
+        self.device_id = None
+        self.client_name = None
+        self.client_type = "unknown"
+        self.connected_at = None  # Set in handle() method
+
+    def close(self) -> None:
+        """
+        Closes the websocket connection.
+
+        This method cancels the receiver and sender tasks, if they exist, to close the websocket connection.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self.clear_subscriptions()
+        self._has_work.set()
+        if self._receiver_task:
+            self._receiver_task.cancel()
+        if self._sender_task:
+            self._sender_task.cancel()
+
+    def clear_subscriptions(self) -> None:
+        """
+        Clears all the subscriptions by calling the registered listener functions.
+        """
+        for subscription_id in tuple(self._listeners):
+            self._remove_subscription(subscription_id)
+
+    @classmethod
+    async def get_all_clients(cls):
+        async with cls.map_lock:
+            return cls.ip_uid_map.copy()
+
+    def _remove_subscription(self, subscription_id: object) -> None:
+        previous = self._listeners.pop(subscription_id, None)
+        if previous is not None:
+            previous()
+        # Filter only event deliveries: protocol results retain their FIFO order.
+        pending: list[dict[str, object]] = []
+        while not self._control_queue.empty():
+            message = self._control_queue.get_nowait()
+            if not (
+                message.get("type") == "event" and message.get("id") == subscription_id
+            ):
+                pending.append(message)
+        for message in pending:
+            self._control_queue.put_nowait(message)
+        self._vis_slots = {
+            key: message
+            for key, message in self._vis_slots.items()
+            if not (
+                message.get("type") == "event" and message.get("id") == subscription_id
+            )
+        }
+
+    def _send_installation_result(self, message: dict[str, object]) -> None:
+        """Admit readiness results without the legacy queue-wiping fallback."""
+        if self._installation_reply_failed or self._closed:
+            return
+        if self._control_queue.full():
+            self._fail_control_backlog()
+            return
+        self._control_queue.put_nowait(message)
+        self._has_work.set()
+
+    def _fail_control_backlog(self) -> None:
+        """Terminate once when control overflow would lose a required reply."""
+        if self._installation_reply_failed or self._closed:
+            return
+        self._installation_reply_failed = True
+        self.clear_subscriptions()
+        self._has_work.set()
+        # Interrupt a terminal-error write even if the failure close stalls.
+        if self._receiver_error_reply is not None and self._sender_task is not None:
+            self._sender_task.cancel()
+        if self._installation_close_task is None:
+            self._installation_close_task = self._ledfx.loop.create_task(
+                self._close_failed_installation_reply()
+            )
+            self._installation_close_task.add_done_callback(
+                self._observe_installation_close
+            )
+
+    async def _close_failed_installation_reply(self) -> None:
+        try:
+            if self._socket is not None:
+                await self._socket.close(
+                    code=1013, message=b"control backlog; reconnect and resync"
+                )
+        finally:
+            self.close()
+
+    def _observe_installation_close(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled() and (error := task.exception()) is not None:
+            _LOGGER.error(
+                "Unable to close websocket after installation reply failure: %s", error
+            )
+
+    def send(self, message: dict[str, object]) -> None:
+        """Sends a message to the websocket connection.
+
+        Vis updates (VISUALISATION_UPDATE / DEVICE_UPDATE) are placed in a
+        per-vis_id single-slot mailbox so the newest frame always overwrites
+        the previous unsent one.  All other messages go to an ordered control
+        queue for reliable delivery.
+        """
+        if self._installation_reply_failed or self._closed:
+            self._has_work.set()
+            return
+
+        event_type = message.get("event_type")
+        if event_type in (
+            Event.VISUALISATION_UPDATE,
+            Event.DEVICE_UPDATE,
+        ):
+            # Single-slot mailbox: overwrite any pending frame for this vis_id
+            vis_id = message.get("vis_id")
+            self._vis_slots[vis_id] = message
+        else:
+            # Ordered control message
+            if self._control_queue.qsize() >= MAX_PENDING_MESSAGES:
+                # Inspect at most the bounded FIFO without yielding. Required
+                # replies may only be abandoned by terminating the connection.
+                pending: list[dict[str, object]] = []
+                protected_reply = False
+                while not self._control_queue.empty():
+                    queued = self._control_queue.get_nowait()
+                    pending.append(queued)
+                    queued_type = queued.get("type")
+                    if queued is self._receiver_error_reply or (
+                        isinstance(queued_type, str) and queued_type == "result"
+                    ):
+                        protected_reply = True
+                if protected_reply:
+                    for queued in pending:
+                        self._control_queue.put_nowait(queued)
+                    self._fail_control_backlog()
+                    return
+                _LOGGER.warning(
+                    "Control queue full (%s), dropping all pending messages",
+                    MAX_PENDING_MESSAGES,
+                )
+            try:
+                self._control_queue.put_nowait(message)
+            except asyncio.QueueFull:
+                _LOGGER.error(
+                    "Client sender queue size exceeded %s",
+                    MAX_PENDING_MESSAGES,
+                )
+                self.close()
+                return
+
+        self._has_work.set()
+
+    def send_error(self, id: object, message: str) -> None:
+        """Sends an error string to the websocket connection.
+
+        Args:
+            id (int): The ID of the error message.
+            message (str): The error message to be sent.
+
+
+        """
+
+        return self.send(
+            {
+                "id": id,
+                "success": False,
+                "error": {"message": message},
+            }
+        )
+
+    def send_event(self, id: object, event: Event) -> None:
+        """
+        Sends an event notification to the websocket connection.
+
+        Args:
+            id (str): The ID of the event.
+            event (Event): The event object to be sent.
+
+        """
+
+        return self.send({"id": id, "type": "event", **event.to_dict()})
+
+    async def _sender(self) -> None:
+        """Async write loop servicing control queue and vis mailbox.
+
+        Control messages are drained first (ordered, reliable).  Then the
+        latest vis frame for each vis_id is sent — any frames that were
+        overwritten between wake-ups are silently dropped, keeping latency
+        bounded and memory constant per vis_id.
+        """
+        socket = self._socket
+        if socket is None:
+            return
+        _LOGGER.info("Starting websocket sender")
+        while (
+            not socket.closed
+            and not self._closed
+            and not self._installation_reply_failed
+        ):
+            await self._has_work.wait()
+            self._has_work.clear()
+            if self._closed or self._installation_reply_failed:
+                return
+
+            # --- control messages (reliable, ordered) ---
+            while not self._control_queue.empty():
+                if self._closed or self._installation_reply_failed:
+                    return
+                try:
+                    message = self._control_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                try:
+                    await socket.send_json(message, dumps=dumps)
+                except TypeError as err:
+                    _LOGGER.error(
+                        "Unable to serialize to JSON: %s\n%s",
+                        err,
+                        message,
+                    )
+                except ConnectionResetError:
+                    _LOGGER.info("Websocket connection closed by the client.")
+                    return
+                if message is self._receiver_error_reply:
+                    return
+
+            # --- vis frames (latest-value-wins per vis_id) ---
+            if self._vis_slots:
+                # Bound this pass while keeping pending deliveries purgeable.
+                for vis_id in tuple(self._vis_slots):
+                    if self._closed or self._installation_reply_failed:
+                        return
+                    message = self._vis_slots.pop(vis_id, None)
+                    if message is None:
+                        continue
+                    try:
+                        await socket.send_json(message, dumps=dumps)
+                    except TypeError as err:
+                        _LOGGER.error(
+                            "Unable to serialize to JSON: %s\n%s",
+                            err,
+                            message,
+                        )
+                    except ConnectionResetError:
+                        _LOGGER.info("Websocket connection closed by the client.")
+                        return
+
+        _LOGGER.info("Stopped websocket sender.")
+
+    async def handle(self, request):
+        """Handle the websocket connection"""
+
+        self.client_ip = request.remote
+        self.connected_at = time.time()
+
+        async with WebsocketConnection.map_lock:
+            self.uid = str(uuid.uuid4())
+            WebsocketConnection.ip_uid_map[self.uid] = self.client_ip
+
+        socket = self._socket = web.WebSocketResponse(
+            protocols=("http", "https", "ws", "wss")
+        )
+
+        # print(request.protocol)
+        # print(socket._protocols)
+        # headers = request.headers
+        # from aiohttp import hdrs
+        # protocol = None
+        # print(headers)
+        # print("SEC_WEBSOCKET_PROTOCOL", hdrs.SEC_WEBSOCKET_PROTOCOL)
+        # print(hdrs.SEC_WEBSOCKET_PROTOCOL in headers)
+        # if hdrs.SEC_WEBSOCKET_PROTOCOL in headers:
+        #     req_protocols = [
+        #         str(proto.strip())
+        #         for proto in headers[hdrs.SEC_WEBSOCKET_PROTOCOL].split(",")
+        #     ]
+        #     print("req",req_protocols)
+        #     for proto in req_protocols:
+        #         if proto in socket._protocols:
+        #             protocol = proto
+        #             break
+        #     else:
+        #         # No overlap found: Return no protocol as per spec
+        #         _LOGGER.warning(
+        #             "Client protocols %r don’t overlap server-known ones %r",
+        #             req_protocols,
+        #             socket._protocols,
+        #         )
+        # print(protocol)
+        # print(socket.can_prepare(request))
+        # print(socket._protocols)
+        # print(socket.ws_protocol)
+
+        await socket.prepare(request)
+
+        _LOGGER.info("Websocket connected.")
+
+        # Send UID to the client
+        await self._socket.send_json({"event_type": "client_id", "client_id": self.uid})
+
+        self._receiver_task = asyncio.current_task(loop=self._ledfx.loop)
+        sender_task = self._sender_task = self._ledfx.loop.create_task(self._sender())
+
+        self._ledfx.events.fire_event(ClientConnectedEvent(self.uid, self.client_ip))
+
+        def shutdown_handler(e):
+            self.close()
+
+        remove_listeners = self._ledfx.events.add_listener(
+            shutdown_handler, Event.LEDFX_SHUTDOWN
+        )
+
+        message: dict[str, object] | None = None
+        try:
+            ws_msg = await socket.receive()
+            while ws_msg.type in (WSMsgType.TEXT, WSMsgType.BINARY):
+                if ws_msg.type == WSMsgType.BINARY:
+                    self._handle_binary_message(ws_msg.data)
+                    ws_msg = await socket.receive()
+                    continue
+
+                # A parse/validation failure must not reuse the preceding ID
+                # or try to read dictionary keys from scalar/array JSON.
+                message = None
+                raw_message = ws_msg.json()
+                if isinstance(raw_message, dict):
+                    message = raw_message
+                message = BaseMessage.model_validate(raw_message).model_dump()
+
+                if message["type"] in websocket_handlers:
+                    # Phase 1: Support async handlers
+                    handler = websocket_handlers[message["type"]]
+                    if inspect.iscoroutinefunction(handler):
+                        await handler(self, message)
+                    else:
+                        handler(self, message)
+                else:
+                    _LOGGER.error("Received unknown command %s", message["type"])
+                    self.send_error(message["id"], "Unknown command type.")
+
+                ws_msg = await socket.receive()
+
+        except ValueError:  # includes pydantic's ValidationError
+            _LOGGER.info("Invalid message format.")
+            if message is not None:
+                msg_id = message.get("id")
+                if msg_id is not None:
+                    self._receiver_error_reply = {
+                        "id": msg_id,
+                        "success": False,
+                        "error": {"message": "Invalid message format."},
+                    }
+                    self.send(self._receiver_error_reply)
+
+        except TypeError:
+            if socket.closed:
+                _LOGGER.info("Connection closed by client.")
+            else:
+                _LOGGER.exception("Unexpected TypeError")
+
+        except (asyncio.CancelledError, futures.CancelledError):
+            _LOGGER.info("Connection cancelled")
+        # Hopefully get rid of the aiohttp connection reset errors
+        except ConnectionResetError:
+            _LOGGER.info("Connection reset")
+
+        except Exception:
+            _LOGGER.exception("Unexpected Exception")
+
+        finally:
+            self.clear_subscriptions()
+            if (
+                self._receiver_error_reply is not None
+                and not self._closed
+                and not self._installation_reply_failed
+                and not socket.closed
+            ):
+                # The one socket writer preserves FIFO and stops at this reply.
+                # Keep shutdown listening active so forced close aborts the grace.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(sender_task, return_exceptions=True),
+                        timeout=FINAL_ERROR_REPLY_TIMEOUT,
+                    )
+                except (TimeoutError, asyncio.CancelledError):
+                    pass
+            async with WebsocketConnection.map_lock:
+                if self.uid in WebsocketConnection.ip_uid_map:
+                    del WebsocketConnection.ip_uid_map[self.uid]
+            # Phase 1: Clean up client metadata on disconnect
+            async with WebsocketConnection.metadata_lock:
+                if self.uid in WebsocketConnection.client_metadata:
+                    del WebsocketConnection.client_metadata[self.uid]
+            remove_listeners()
+            self._closed = True
+            if self._installation_close_task is not None:
+                self._installation_close_task.cancel()
+                await asyncio.gather(
+                    self._installation_close_task, return_exceptions=True
+                )
+
+            # Stop and await the sender even when the control FIFO is full.
+            sender_task.cancel()
+            await asyncio.gather(sender_task, return_exceptions=True)
+
+            # Close the connection
+            await socket.close()
+            _LOGGER.info("Closed connection")
+
+            self._ledfx.events.fire_event(
+                ClientDisconnectedEvent(self.uid, self.client_ip)
+            )
+            self._ledfx.events.fire_event(ClientsUpdatedEvent())
+
+        return socket
+
+    # Phase 1: Metadata utility methods
+    async def _name_exists(self, name, exclude_uuid=None):
+        """Check if a client name already exists (thread-safe)"""
+        async with WebsocketConnection.metadata_lock:
+            for (
+                client_uuid,
+                meta,
+            ) in WebsocketConnection.client_metadata.items():
+                if client_uuid != exclude_uuid and meta.get("name") == name:
+                    return True
+            return False
+
+    async def _reserve_and_set_client_name(self, desired_name: str) -> tuple[str, bool]:
+        """Atomically check for name conflicts, resolve them, and persist metadata.
+
+        This method acquires metadata_lock once and holds it throughout the entire
+        operation to prevent TOCTOU race conditions where multiple clients could
+        end up with the same name.
+
+        Args:
+            desired_name: The name the client wants to use
+
+        Returns:
+            Tuple of (resolved_name, name_conflict_flag)
+            - resolved_name: The actual name assigned (may have " (N)" suffix)
+            - name_conflict_flag: True if the name was modified due to conflict
+        """
+        async with WebsocketConnection.metadata_lock:
+            # Check uniqueness and resolve conflicts while holding lock
+            original_name = desired_name
+            resolved_name = desired_name
+            counter = 1
+            name_conflict = False
+
+            while True:
+                # Check if name exists (exclude self)
+                name_taken = False
+                for (
+                    client_uuid,
+                    meta,
+                ) in WebsocketConnection.client_metadata.items():
+                    if client_uuid != self.uid and meta.get("name") == resolved_name:
+                        name_taken = True
+                        break
+
+                if not name_taken:
+                    break
+
+                # Name conflict - increment counter
+                name_conflict = True
+                counter += 1
+                resolved_name = f"{original_name} ({counter})"
+
+            # Update instance attribute
+            self.client_name = resolved_name
+
+            # Persist metadata (still holding lock)
+            WebsocketConnection.client_metadata[self.uid] = {
+                "ip": self.client_ip,
+                "name": self.client_name,
+                "type": self.client_type,
+                "device_id": self.device_id,
+                "connected_at": self.connected_at,
+            }
+
+            return resolved_name, name_conflict
+
+    async def _update_metadata(self):
+        """Update class-level metadata storage (thread-safe)"""
+        async with WebsocketConnection.metadata_lock:
+            WebsocketConnection.client_metadata[self.uid] = {
+                "ip": self.client_ip,
+                "name": self.client_name,
+                "type": self.client_type,
+                "device_id": self.device_id,
+                "connected_at": self.connected_at,
+            }
+
+    @classmethod
+    async def get_all_clients_metadata(cls):
+        """Get deep copy of all client metadata (thread-safe)"""
+        async with cls.metadata_lock:
+            return {uuid: meta.copy() for uuid, meta in cls.client_metadata.items()}
+
+    @websocket_handler("set_client_info")
+    async def set_client_info_handler(self, message):
+        """Handle client metadata initialization"""
+        data = message.get("data", {})
+        device_id = data.get("device_id")
+        name = data.get("name")
+        client_type = data.get("type", "unknown")
+
+        # Validate client_type
+        if client_type not in VALID_CLIENT_TYPES:
+            _LOGGER.warning(
+                "Invalid client_type '%s' from %s, defaulting to 'unknown'",
+                client_type,
+                self.uid,
+            )
+            client_type = "unknown"
+
+        # Generate default name if not provided
+        if not name:
+            name = f"Client-{self.uid[:8]}"
+
+        # Store device_id and type before atomic name reservation
+        self.device_id = device_id
+        self.client_type = client_type
+
+        # Atomically check, resolve conflicts, and persist metadata
+        # This prevents TOCTOU race conditions
+        resolved_name, name_conflict = await self._reserve_and_set_client_name(name)
+
+        # Send confirmation (after atomic operation completes)
+        self.send(
+            {
+                "id": message["id"],
+                "event_type": "client_info_updated",
+                "client_id": self.uid,
+                "name": resolved_name,
+                "type": self.client_type,
+                "name_conflict": name_conflict,
+            }
+        )
+
+        # Fire event (only after metadata is persisted)
+        self._ledfx.events.fire_event(ClientsUpdatedEvent())
+        _LOGGER.info(
+            "Client %s set info: name='%s', type='%s'",
+            self.uid,
+            resolved_name,
+            self.client_type,
+        )
+
+    @websocket_handler("update_client_info")
+    async def update_client_info_handler(self, message):
+        """Handle client metadata updates (name and type)"""
+        data = message.get("data", {})
+        name = data.get("name")
+        client_type = data.get("type")
+
+        # Validate and normalize type if provided
+        if client_type is not None and client_type not in VALID_CLIENT_TYPES:
+            _LOGGER.warning(
+                "Invalid client_type '%s' from %s, defaulting to 'unknown'",
+                client_type,
+                self.uid,
+            )
+            client_type = "unknown"
+
+        # Check if any updates were provided
+        if name is None and client_type is None:
+            # No valid updates provided
+            self.send_error(message["id"], "No valid updates provided")
+            return
+
+        # Atomically update name and/or type (prevents TOCTOU race)
+        async with WebsocketConnection.metadata_lock:
+            # Check if name is already taken by another client (if name update requested)
+            if name is not None:
+                for (
+                    client_uuid,
+                    meta,
+                ) in WebsocketConnection.client_metadata.items():
+                    if client_uuid != self.uid and meta.get("name") == name:
+                        self.send_error(
+                            message["id"],
+                            f"Name '{name}' is already taken by another client",
+                        )
+                        return
+
+                # Name is available - update instance attribute
+                self.client_name = name
+
+            # Update type if provided
+            if client_type is not None:
+                self.client_type = client_type
+
+            # Persist metadata (still holding lock)
+            WebsocketConnection.client_metadata[self.uid] = {
+                "ip": self.client_ip,
+                "name": self.client_name,
+                "type": self.client_type,
+                "device_id": self.device_id,
+                "connected_at": self.connected_at,
+            }
+
+        # Send confirmation (after atomic operation completes)
+        self.send(
+            {
+                "id": message["id"],
+                "event_type": "client_info_updated",
+                "client_id": self.uid,
+                "name": self.client_name,
+                "type": self.client_type,
+            }
+        )
+
+        # Fire event
+        self._ledfx.events.fire_event(ClientsUpdatedEvent())
+
+        # Log what was updated
+        updates = []
+        if name is not None:
+            updates.append(f"name='{self.client_name}'")
+        if client_type is not None:
+            updates.append(f"type='{self.client_type}'")
+        _LOGGER.info("Client %s updated: %s", self.uid, ", ".join(updates))
+
+    # Phase 3: Broadcasting methods
+    def _filter_targets(
+        self, target_config: dict, clients: dict, sender_uuid: str
+    ) -> list[str]:
+        """Filter clients based on target configuration (fail-closed validation).
+
+        Args:
+            target_config: Targeting specification with mode and parameters
+            clients: Dictionary of connected clients {uuid: metadata}
+            sender_uuid: UUID of sender (excluded from mode='all' to prevent self-echo)
+
+        Returns:
+            List of target client UUIDs (sender excluded from mode='all')
+        """
+        mode = target_config.get("mode")
+
+        if mode == "all":
+            # Exclude sender to prevent self-echo
+            return [uuid for uuid in clients if uuid != sender_uuid]
+
+        elif mode == "type":
+            value = target_config.get("value")
+            if not value:
+                _LOGGER.warning("Target mode 'type' requires 'value' field")
+                return []
+            return [
+                client_uuid
+                for client_uuid, meta in clients.items()
+                if meta.get("type") == value
+            ]
+
+        elif mode == "names":
+            names = target_config.get("names")
+            if not names or not isinstance(names, list):
+                _LOGGER.warning("Target mode 'names' requires 'names' list")
+                return []
+            return [
+                client_uuid
+                for client_uuid, meta in clients.items()
+                if meta.get("name") in names
+            ]
+
+        elif mode == "uuids":
+            uuids = target_config.get("uuids")
+            if not uuids or not isinstance(uuids, list):
+                _LOGGER.warning("Target mode 'uuids' requires 'uuids' list")
+                return []
+            # Only return UUIDs that exist in connected clients
+            return [client_uuid for client_uuid in uuids if client_uuid in clients]
+
+        else:
+            _LOGGER.warning("Invalid target mode: %s", mode)
+            return []
+
+    @websocket_handler("broadcast")
+    async def broadcast_handler(self, message):
+        """Handle client-to-client broadcast messages (WebSocket-only)"""
+        try:
+            data = message.get("data", {})
+            validated_data = BroadcastData.model_validate(data).model_dump(
+                exclude_unset=True
+            )
+        except ValidationError as e:
+            self.send_error(message["id"], f"Invalid broadcast data: {e}")
+            return
+
+        # Validate payload size
+        payload = validated_data["payload"]
+        payload_bytes = json.dumps(payload, ensure_ascii=False, default=default).encode(
+            "utf-8"
+        )
+        payload_size = len(payload_bytes)
+        if payload_size > MAX_PAYLOAD_SIZE:
+            self.send_error(
+                message["id"],
+                f"Payload size ({payload_size} bytes) exceeds maximum ({MAX_PAYLOAD_SIZE} bytes)",
+            )
+            return
+
+        # Get all client metadata
+        clients = await WebsocketConnection.get_all_clients_metadata()
+
+        # Derive sender identity from WebSocket connection (server-side)
+        sender_uuid = self.uid
+        sender_name = self.client_name or f"Client-{sender_uuid[:8]}"
+        sender_type = self.client_type
+
+        # Filter targets based on target configuration
+        target_config = validated_data["target"]
+        target_uuids = self._filter_targets(target_config, clients, sender_uuid)
+
+        # Reject if no targets matched
+        if not target_uuids:
+            self.send_error(
+                message["id"],
+                f"No clients matched target specification: {target_config}",
+            )
+            return
+
+        # Generate unique broadcast ID
+        broadcast_id = f"b-{uuid.uuid4()}"
+
+        # Fire broadcast event (subscribers will receive it)
+        self._ledfx.events.fire_event(
+            ClientBroadcastEvent(
+                broadcast_type=validated_data["broadcast_type"],
+                broadcast_id=broadcast_id,
+                sender_uuid=sender_uuid,
+                sender_name=sender_name,
+                sender_type=sender_type,
+                target_uuids=target_uuids,
+                payload=payload,
+            )
+        )
+
+        # Log broadcast for audit
+        _LOGGER.info(
+            "Broadcast %s: type=%s, sender=%s (%s), targets=%s clients",
+            broadcast_id,
+            validated_data["broadcast_type"],
+            sender_name,
+            sender_uuid[:8],
+            len(target_uuids),
+        )
+
+        # Send success response
+        self.send(
+            {
+                "id": message["id"],
+                "event_type": "broadcast_sent",
+                "broadcast_id": broadcast_id,
+                "targets_matched": len(target_uuids),
+                "target_uuids": target_uuids,
+            }
+        )
+
+    @websocket_handler("get_event_capabilities")
+    def get_event_capabilities_handler(self, message: dict[str, object]) -> None:
+        self._send_installation_result(
+            {
+                "id": message["id"],
+                "type": "result",
+                "success": True,
+                "result": {"subscription_ack": 1},
+            }
+        )
+
+    @websocket_handler("subscribe_event")
+    def subscribe_event_handler(self, message: dict[str, object]) -> None:
+        if self._installation_reply_failed or self._closed:
+            return
+        ack = message.get("ack", False)
+        if type(ack) is not bool:
+            self.send_error(message["id"], "ack must be a boolean")
+            return
+        event_type = message.get("event_type")
+        if not isinstance(event_type, str) or not event_type:
+            self.send_error(message["id"], "event_type must be a nonempty string")
+            return
+        event_filter = message.get("event_filter", {})
+        if event_filter is not None and not isinstance(event_filter, Mapping):
+            self.send_error(message["id"], "event_filter must be a mapping")
+            return
+        if event_type in NON_SUBSCRIBABLE_EVENTS:
+            msg = (
+                f"Websocket cannot subscribe to {event_type} events - "
+                f"use {NON_SUBSCRIBABLE_EVENTS[event_type]} instead"
+            )
+            _LOGGER.warning("%s.", msg)
+            self.send_error(message["id"], msg)
+            return
+
+        subscription_id = message["id"]
+        _LOGGER.debug(
+            "Websocket subscribing to event %s with filter %s", event_type, event_filter
+        )
+        self._remove_subscription(subscription_id)
+
+        def notify_websocket(event: Event) -> None:
+            if self._listeners.get(subscription_id) is disposer:
+                self.send_event(subscription_id, event)
+
+        try:
+            disposer = self._ledfx.events.add_listener(
+                notify_websocket,
+                event_type,
+                dict(event_filter) if event_filter is not None else None,
+            )
+        except (TypeError, ValueError) as error:
+            self.send_error(subscription_id, str(error))
+            return
+
+        self._listeners[subscription_id] = disposer
+        if ack:
+            self._send_installation_result(
+                {
+                    "id": subscription_id,
+                    "type": "result",
+                    "success": True,
+                    "result": {
+                        "subscription_id": subscription_id,
+                        "event_type": event_type,
+                        "installed": True,
+                    },
+                }
+            )
+
+    @websocket_handler("unsubscribe_event")
+    def unsubscribe_event_handler(self, message: dict[str, object]) -> None:
+        subscription_id = message["id"]
+        _LOGGER.debug("Websocket unsubscribing event id %s", subscription_id)
+        if subscription_id not in self._listeners:
+            _LOGGER.warning("Unsubscribe unknown subscription ID %s", subscription_id)
+        self._remove_subscription(subscription_id)
+
+    @websocket_handler("audio_stream_start")
+    def audio_stream_start_handler(self, message):
+        client = message.get("client")
+
+        if client in WEB_AUDIO_CLIENTS:
+            _LOGGER.warning("Web audio client %s already exists", client)
+            return
+
+        _LOGGER.info("Web audio stream opened by client %s", client)
+        WEB_AUDIO_CLIENTS.add(client)
+
+    @websocket_handler("audio_stream_stop")
+    def audio_stream_stop_handler(self, message):
+        client = message.get("client")
+        _LOGGER.info("Web audio stream closed by client %s", client)
+        WEB_AUDIO_CLIENTS.discard(client)
+
+    @websocket_handler("audio_stream_config")
+    def audio_stream_config_handler(self, message):
+        _LOGGER.info(
+            "WebAudioConfig from %s: %s",
+            message.get("client"),
+            message.get("data"),
+        )
+
+    @websocket_handler("audio_stream_data")
+    def audio_stream_data_handler(self, message):
+        # _LOGGER.info(
+        #     "Websocket: {} incoming from {} with type {}".format(
+        #         message.get("event_type"),
+        #         message.get("client"),
+        #         type(message.get("data")),
+        #     )
+        # )
+
+        if not ACTIVE_AUDIO_STREAM:
+            return
+
+        client = message.get("client")
+
+        if ACTIVE_AUDIO_STREAM.client != client:
+            return
+        data = message.get("data")
+        # The frontend sends a list; older ones sent a {"0": ...} dict
+        if isinstance(data, dict):
+            data = list(data.values())
+        try:
+            # np.fromiter would also take a string, or numeric strings, as
+            # samples; the frontend only ever sends a list of numbers.
+            if not isinstance(data, list) or not all(
+                isinstance(sample, (int, float)) for sample in data
+            ):
+                raise TypeError(type(data).__name__)
+            samples = np.fromiter(data, dtype=np.float32)
+        except (TypeError, ValueError, OverflowError):
+            _LOGGER.warning("Malformed audio_stream_data from client %s", client)
+            return
+        ACTIVE_AUDIO_STREAM.data = samples
+
+    @websocket_handler("audio_stream_data_v2")
+    def audio_stream_data_base64_handler(self, message):
+        # Max value for signed 16-bit values.
+        if not ACTIVE_AUDIO_STREAM:
+            return
+
+        client = message.get("client")
+
+        if ACTIVE_AUDIO_STREAM.client != client:
+            return
+        try:
+            decoded = pybase64.b64decode(message.get("data"))
+        except binascii.Error:
+            _LOGGER.info("Incorrect base64 padding.")
+        except Exception:
+            _LOGGER.exception("Unexpected Exception in base64 decoding")
+        else:
+            fmt = f"<{len(decoded) // 2}h"
+            data = list(struct.unpack(fmt, decoded))
+            # Minimum value is -32768 for signed, so that's why if the number is negative,
+            # it is divided by 32768 when converting to float.
+            data = np.array(
+                [d / MAX_VAL if d >= 0 else d / (MAX_VAL + 1) for d in data],
+                dtype=np.float32,
+            )
+            ACTIVE_AUDIO_STREAM.data = data
+
+    @websocket_handler("song_info")
+    def song_info_handler(self, message):
+        """
+        Handle incoming song/media info and broadcast to all subscribed clients.
+
+        Expected message format:
+        {
+            "id": int,
+            "type": "song_info",
+            "title": str,
+            "artist": str,
+            "album": str (optional),
+            "thumbnail": str (optional),
+            "position": float (optional),
+            "duration": float (optional),
+            "playing": bool (optional),
+            "timestamp": float (optional)
+        }
+        """
+        _LOGGER.info(
+            "Received song info: %s - %s",
+            message.get("artist"),
+            message.get("title"),
+        )
+
+        # Fire the event which will be broadcast to all subscribed clients
+        self._ledfx.events.fire_event(
+            SongDetectedEvent(
+                title=message.get("title", "Unknown"),
+                artist=message.get("artist", "Unknown"),
+                album=message.get("album", ""),
+                thumbnail=message.get("thumbnail"),
+                position=message.get("position"),
+                duration=message.get("duration"),
+                playing=message.get("playing", False),
+                timestamp=message.get("timestamp"),
+            )
+        )
+
+    _BINARY_MSG_FRONTEND_VIS = 0x01
+
+    def _handle_binary_message(self, data: bytes) -> None:
+        """Dispatch a raw binary WebSocket frame.
+
+        Binary frame layout (all integers little-endian):
+          [0]             uint8   message_type (0x01 = frontend_visualiser_data)
+          [1-2]           uint16  width
+          [3-4]           uint16  height
+          [5]             uint8   vis_id byte length (N)
+          [6 .. 6+N-1]   bytes   vis_id (UTF-8)
+          [6+N]           uint8   client_id byte length (M)  -- ignored, self.uid used
+          [7+N ..]        bytes   RGB pixels (width * height * 3)
+        """
+        try:
+            if len(data) < 1:
+                return
+            msg_type = data[0]
+
+            if msg_type == self._BINARY_MSG_FRONTEND_VIS:
+                self._handle_frontend_vis(data)
+            # Add additional binary message type handlers here following
+            # the same pattern: elif msg_type == self._BINARY_MSG_XXX:
+            #     self._handle_xxx(data)
+            else:
+                _LOGGER.warning(
+                    "Unknown binary message type 0x%02x from %s",
+                    msg_type,
+                    self.uid,
+                )
+
+        except (ValueError, TypeError, struct.error) as e:
+            _LOGGER.warning("Malformed binary frame from %s: %s", self.uid, e)
+
+    def _handle_frontend_vis(self, data: bytes) -> None:
+        """Parse and dispatch a frontend visualiser binary frame.
+
+        Binary frame layout (after the 1-byte message type):
+          [1-2]           uint16  width
+          [3-4]           uint16  height
+          [5]             uint8   vis_id byte length (N)
+          [6 .. 6+N-1]   bytes   vis_id (UTF-8)
+          [6+N]           uint8   client_id byte length (M)  -- ignored, self.uid used
+          [7+N ..]        bytes   RGB pixels (width * height * 3)
+        """
+        if len(data) < 6:
+            _LOGGER.warning(
+                "Binary frontend_visualiser_data too short from %s",
+                self.uid,
+            )
+            return
+
+        width, height = struct.unpack_from("<HH", data, 1)
+        vis_id_len = data[5]
+        offset = 6
+
+        if len(data) < offset + vis_id_len:
+            _LOGGER.warning(
+                "Binary frontend_visualiser_data truncated vis_id from %s",
+                self.uid,
+            )
+            return
+
+        vis_id = data[offset : offset + vis_id_len].decode("utf-8")
+        offset += vis_id_len
+
+        # Skip client_id length + bytes — identity comes from self.uid
+        if len(data) < offset + 1:
+            _LOGGER.warning(
+                "Binary frontend_visualiser_data missing client_id length from %s",
+                self.uid,
+            )
+            return
+        client_id_len = data[offset]
+        offset += 1 + client_id_len
+
+        expected_pixel_bytes = width * height * 3
+        pixel_data = data[offset:]
+        if len(pixel_data) != expected_pixel_bytes:
+            _LOGGER.warning(
+                "Binary frontend_visualiser_data pixel size mismatch from %s: "
+                "expected %d bytes for %dx%d, got %d",
+                self.uid,
+                expected_pixel_bytes,
+                width,
+                height,
+                len(pixel_data),
+            )
+            return
+
+        pixels = np.frombuffer(pixel_data, dtype=np.uint8).reshape(height, width, 3)
+        self._ledfx.events.fire_event(
+            FrontendVisualiserDataEvent(
+                vis_id=vis_id,
+                pixels=pixels,
+                shape=[height, width],
+                client_id=self.uid,
+            )
+        )
+
+
+class WebAudioStream:
+    def __init__(self, client: str, callback: callable):
+        self.client = client
+        self.callback = callback
+        self._data = None
+        self._active = False
+
+    def start(self):
+        self._active = True
+
+    def stop(self):
+        self._active = False
+
+    def close(self):
+        self._active = False
+
+    @property
+    def data(self, x):  # noqa: PLR0206
+        return self._data
+
+    @data.setter
+    def data(self, x):
+        self._data = x
+        if self._active:
+            try:
+                self.callback(self._data, None, None, None)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("%s", e)

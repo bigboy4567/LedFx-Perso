@@ -1,0 +1,263 @@
+import asyncio
+import json
+from pathlib import Path
+
+import pytest
+from aiohttp import web
+
+from ledfx.api.playlists import PlaylistsEndpoint
+from ledfx.playlists import PlaylistManager
+from tests.test_utilities.fake_ledfx import fake_ledfx
+
+
+class DummyCoreWithEvents:
+    def __init__(self, tmpdir):
+        self.config_dir = tmpdir
+        fake = fake_ledfx({"playlists": {}, "scenes": {}})
+        self.config = fake.config
+        self.config_store = fake.config_store
+        self.scenes = type(
+            "S",
+            (),
+            {
+                "activated": [],
+                "activate": lambda self, s: self.activated.append(s),
+            },
+        )()
+        # simple event collector
+        self.events = type(
+            "E",
+            (),
+            {"fired": [], "fire_event": lambda self, e: self.fired.append(e)},
+        )()
+
+
+@pytest.mark.asyncio
+async def test_events_include_timing_fields(tmp_path):
+    core = DummyCoreWithEvents(str(tmp_path))
+    manager = PlaylistManager(core)
+
+    playlist = {
+        "id": "evt1",
+        "name": "Evt1",
+        "items": [{"scene_id": "s1", "duration_ms": 700}],
+    }
+    await manager.create_or_replace(playlist)
+    await manager.start("evt1")
+    await asyncio.sleep(0.05)
+
+    # ensure we recorded events and that at least one has effective_duration_ms
+    fired = list(core.events.fired)
+    assert len(fired) > 0
+    assert any(hasattr(ev, "effective_duration_ms") for ev in fired)
+    # pause should produce a paused event with remaining_ms
+    await manager.pause()
+    await asyncio.sleep(0.01)
+    assert any(hasattr(ev, "remaining_ms") for ev in core.events.fired)
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_recovery_checkpoint_preserves_playlist_position_and_order(
+    tmp_path: Path,
+):
+    core = DummyCoreWithEvents(str(tmp_path))
+    manager = PlaylistManager(core)
+    await manager.create_or_replace(
+        {
+            "id": "recovery",
+            "name": "Recovery",
+            "items": [
+                {"scene_id": f"scene-{index}", "duration_ms": 10000}
+                for index in range(4)
+            ],
+            "mode": "shuffle",
+        }
+    )
+    await manager.start("recovery")
+    await asyncio.sleep(0.02)
+    checkpoint = manager.recovery_checkpoint()
+    await manager.pause()
+
+    assert checkpoint["active"] is True
+    assert checkpoint["playlist_id"] == "recovery"
+    assert len(checkpoint["order"]) == 4
+    assert checkpoint["remaining_ms"] is not None
+    assert await manager.restore_checkpoint(checkpoint)
+    state = await manager.get_state()
+    assert state["active_playlist"] == "recovery"
+    assert state["index"] == checkpoint["index"]
+    assert state["order"] == checkpoint["order"]
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_delete_emits_stopped_event(tmp_path):
+    core = DummyCoreWithEvents(str(tmp_path))
+    manager = PlaylistManager(core)
+
+    playlist = {
+        "id": "del1",
+        "name": "Del1",
+        "items": [{"scene_id": "x", "duration_ms": 1000}],
+    }
+    await manager.create_or_replace(playlist)
+    await manager.start("del1")
+    await asyncio.sleep(0.01)
+
+    # delete should stop and fire a stopped event
+    await manager.delete("del1")
+    await asyncio.sleep(0.01)
+    fired_types = [getattr(e, "event_type", None) for e in core.events.fired]
+    assert "playlist_stopped" in fired_types
+
+
+def make_minimal_ledfx_for_endpoint(tmp_path):
+    # minimal object with config used by PlaylistManager
+    ledfx = type("L", (), {})()
+    fake = fake_ledfx({"playlists": {}})
+    ledfx.config = fake.config
+    ledfx.config_store = fake.config_store
+    ledfx.config_dir = str(tmp_path)
+    ledfx.playlists = PlaylistManager(ledfx)  # as LedFxCore does at startup
+    return ledfx
+
+
+@pytest.mark.asyncio
+async def test_active_endpoint_returns_null_when_inactive(tmp_path):
+    ledfx = make_minimal_ledfx_for_endpoint(tmp_path)
+    endpoint = PlaylistsEndpoint(ledfx)
+
+    class DummyRequest:
+        def __init__(self, data):
+            self._data = data
+
+        async def json(self):
+            return self._data
+
+    req = DummyRequest({"action": "state"})
+    resp: web.Response = await endpoint.put(req)
+    body = json.loads(resp.text)
+    # The action-based state returns an object; ensure active_playlist is None
+    assert body.get("data").get("state").get("active_playlist") is None
+
+
+@pytest.mark.asyncio
+async def test_get_playlists_endpoint_returns_empty_when_no_playlists(
+    tmp_path,
+):
+    """Ensure the collection GET endpoint returns an empty mapping when none exist."""
+    ledfx = make_minimal_ledfx_for_endpoint(tmp_path)
+    endpoint = PlaylistsEndpoint(ledfx)
+    resp: web.Response = await endpoint.get()
+    body = json.loads(resp.text)
+    # PlaylistsEndpoint.bare_request_success returns the payload directly
+    assert body == {"playlists": {}}
+
+
+@pytest.mark.asyncio
+async def test_empty_playlist_resolves_to_all_scenes(tmp_path):
+    """Empty items list should resolve to all available scenes at start time."""
+    core = DummyCoreWithEvents(str(tmp_path))
+    # Add some scenes to the config (matches real LedFx structure)
+    core.config.scenes = {
+        "scene1": {"name": "scene1"},
+        "scene2": {"name": "scene2"},
+        "scene3": {"name": "scene3"},
+    }
+    manager = PlaylistManager(core)
+
+    await manager.create_or_replace({"id": "empty", "name": "Empty", "items": []})
+    ok = await manager.start("empty")
+    # Should succeed because empty list resolves to all scenes
+    assert ok is True
+
+    # Verify runtime items were populated with all scene IDs
+    state = await manager.get_state()
+    assert state.get("active_playlist") == "empty"
+
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_empty_playlist_fails_when_no_scenes(tmp_path):
+    """Empty items list should fail if there are no scenes available."""
+    core = DummyCoreWithEvents(str(tmp_path))
+    # No scenes available
+    core.config.scenes.clear()
+    manager = PlaylistManager(core)
+
+    await manager.create_or_replace({"id": "empty", "name": "Empty", "items": []})
+    ok = await manager.start("empty")
+    # Should fail because no scenes to resolve to
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_jitter_bounds(tmp_path):
+    core = DummyCoreWithEvents(str(tmp_path))
+    manager = PlaylistManager(core)
+
+    playlist = {
+        "id": "j1",
+        "name": "J1",
+        "items": [{"scene_id": "s", "duration_ms": 1000}],
+        "timing": {"jitter": {"enabled": True, "factor_min": 0.5, "factor_max": 2.0}},
+    }
+    await manager.create_or_replace(playlist)
+    await manager.start("j1")
+    await asyncio.sleep(0.05)
+    state = await manager.get_state()
+    eff = state.get("effective_duration_ms")
+    assert eff is not None
+    # should be between 500 (clamp) and 2000 (1k * 2.0)
+    assert 500 <= eff <= 2000
+    await manager.stop()
+
+
+@pytest.mark.asyncio
+async def test_empty_playlist_get_state_returns_scenes(tmp_path):
+    """get_state should return the resolved scenes list for empty playlists."""
+    core = DummyCoreWithEvents(str(tmp_path))
+    # Add scenes in a specific order
+    core.config.scenes = {
+        "scene-alpha": {"name": "scene-alpha"},
+        "scene-beta": {"name": "scene-beta"},
+        "scene-gamma": {"name": "scene-gamma"},
+    }
+    manager = PlaylistManager(core)
+
+    # Create empty playlist in sequence mode
+    await manager.create_or_replace(
+        {
+            "id": "empty-seq",
+            "name": "Empty Sequence",
+            "items": [],
+            "mode": "sequence",
+        }
+    )
+    ok = await manager.start("empty-seq")
+    assert ok is True
+
+    # Get state and verify scenes are included
+    state = await manager.get_state()
+    assert state.get("active_playlist") == "empty-seq"
+    assert state.get("mode") == "sequence"
+
+    # Should have scenes list with all scene IDs
+    scenes = state.get("scenes")
+    assert scenes is not None
+    assert len(scenes) == 3
+    # In sequence mode, should match the order from config
+    assert set(scenes) == {"scene-alpha", "scene-beta", "scene-gamma"}
+
+    # Should have order matching scenes
+    order = state.get("order")
+    assert order is not None
+    assert len(order) == 3
+
+    # Verify scene_id is set to current item
+    scene_id = state.get("scene_id")
+    assert scene_id in {"scene-alpha", "scene-beta", "scene-gamma"}
+
+    await manager.stop()

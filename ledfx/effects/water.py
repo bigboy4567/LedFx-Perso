@@ -1,0 +1,191 @@
+import queue
+
+import numpy as np
+from pydantic import Field
+
+from ledfx.configuration.fields import CoercedFloat
+from ledfx.configuration.plugin import TypedConfig
+from ledfx.effects import smooth
+from ledfx.effects.audio import AudioReactiveEffect
+from ledfx.effects.hsv_effect import HSVEffect
+from ledfx.effects.math import triangle
+from ledfx.utils import empty_queue
+
+
+class Water(AudioReactiveEffect, HSVEffect):
+    """A rippling water effect.
+
+    Bass, mid, and high intensity levels create droplets evenly spaced along the
+    span.
+
+    References:
+        * https://mikro.naprvyraz.sk/docs/Coding/1/WATER.TXT
+        * https://github.com/Zygo/xscreensaver/blob/master/hacks/ripples.c
+    """
+
+    NAME = "Water"
+    CATEGORY = "Atmospheric"
+    USES_MELBANK_RANGE = True
+
+    class Config(HSVEffect.Config):
+        speed: CoercedFloat = Field(1, description="Effect Speed modifier", ge=1, le=3)
+        vertical_shift: CoercedFloat = Field(
+            0.12, description="Vertical Shift", ge=-0.2, le=1
+        )
+        bass_size: CoercedFloat = Field(
+            8, description="Size of bass ripples", ge=0, le=15
+        )
+        mids_size: CoercedFloat = Field(
+            6, description="Size of mids ripples", ge=0, le=15
+        )
+        high_size: CoercedFloat = Field(
+            3, description="Size of high ripples", ge=0, le=15
+        )
+        viscosity: CoercedFloat = Field(
+            6, description="Viscosity of ripples", ge=2, le=12
+        )
+
+    config = TypedConfig(Config)
+
+    def __init__(self, ledfx, config):
+        super().__init__(ledfx, config)
+        # Queue will contain tuples of (pixel location, water height value)
+        self.drops_queue = queue.Queue()
+        # Cache computed config values
+        self._damp_factor = None
+        self._speed_int = None
+
+    def on_activate(self, pixel_count):
+        # Double buffered rendering
+        self._buffer = np.zeros((2, pixel_count))
+        self._cur_buffer = 0
+        # Emitter positions are (percentage of span, speed and direction)
+        self._mids_emitters = [(0.25, 1.0), (0.75, -1.0)]
+        self._high_emitters = [
+            (0.125, 1.5),
+            (0.375, -2.5),
+            (0.625, 2.5),
+            (0.875, -1.5),
+        ]
+        # Pre-compute config-dependent values
+        self._damp_factor = 2**self.config.viscosity
+        self._speed_int = int(self.config.speed)
+
+    def config_updated(self, config):
+        """Cache computed config values to avoid repeated calculations"""
+        self._damp_factor = 2**self.config.viscosity
+        self._speed_int = int(self.config.speed)
+
+    def deactivate(self):
+        empty_queue(self.drops_queue)
+        self.drops_queue = None
+        return super().deactivate()
+
+    def audio_data_updated(self, data):
+        # Just bail out with uselessly-small pixel counts.
+        if self.pixel_count < 5:
+            return
+        if self.drops_queue is None:
+            return
+
+        intensities = np.fromiter((i.max() ** 2 for i in self.melbank_thirds()), float)
+        np.clip(intensities, 0, 1, out=intensities)
+
+        # Bass emitters stay at start, end, and middle.
+        self.drops_queue.put((1, intensities[0] * self.config.bass_size))
+        self.drops_queue.put(
+            (self.pixel_count // 2, intensities[0] * self.config.bass_size)
+        )
+        self.drops_queue.put(
+            (self.pixel_count - 2, intensities[0] * self.config.bass_size)
+        )
+
+        # Emit drops and move the emitter
+        for i in range(len(self._mids_emitters)):
+            mid_pos, mid_speed = self._mids_emitters[i]
+            pos = 1 + int(mid_pos * (self.pixel_count - 2))
+            self.drops_queue.put((pos, intensities[1] * self.config.mids_size))
+            mid_pos += 0.0002 * mid_speed * self.config.speed
+            if mid_pos < 0.0:
+                mid_pos += 1.0
+            elif mid_pos > 1.0:
+                mid_pos -= 1.0
+            self._mids_emitters[i] = (mid_pos, mid_speed)
+
+        for i in range(len(self._high_emitters)):
+            high_pos, high_speed = self._high_emitters[i]
+            pos = 1 + int(high_pos * (self.pixel_count - 2))
+            self.drops_queue.put((pos, intensities[2] * self.config.high_size))
+            high_pos += 0.0002 * high_speed * self.config.speed
+            if high_pos < 0.0:
+                high_pos += 1.0
+            elif high_pos > 1.0:
+                high_pos -= 1.0
+            self._high_emitters[i] = (high_pos, high_speed)
+
+    def render_hsv(self):
+        # Run water calculations
+        for _ in range(self._speed_int):
+            # Flip buffers for each rendering pass.
+            self._cur_buffer = 1 - self._cur_buffer
+            self._do_ripple(self._buffer, self._cur_buffer, self._damp_factor)
+
+        # Create new drops if any (drops_queue is never None during active render)
+        while not self.drops_queue.empty():
+            drop_pos, drop_height = self.drops_queue.get()
+            self._create_drop(drop_pos, drop_height)
+
+        # Render - cache the current buffer reference
+        current_buf = self._buffer[self._cur_buffer]
+        shift_v = self.config.vertical_shift
+
+        # Hues are a triangle of the raw values which makes for some nice effects.
+        self.hsv_array[:, 0] = triangle(current_buf)
+
+        # Shift the values buffer up by the shift amount and then scale to fit.
+        # Values can still be out of bounds, so we clamp.
+        # Important: Keep unclipped version for saturation calculation
+        np.add(current_buf, shift_v, out=self.hsv_array[:, 2])
+        np.divide(self.hsv_array[:, 2], 1 + shift_v, out=self.hsv_array[:, 2])
+
+        # Saturation starts at 1.0, and then for over-bright values (above 1),
+        # reduce saturation to make it look hot.
+        # MUST use unclipped transformed value for saturation calculation
+        np.add(self.hsv_array[:, 2], shift_v, out=self.hsv_array[:, 1])
+        np.multiply(self.hsv_array[:, 1], -1, out=self.hsv_array[:, 1])
+        np.add(self.hsv_array[:, 1], 2.0, out=self.hsv_array[:, 1])
+        np.clip(self.hsv_array[:, 1], 0.0, 1.0, out=self.hsv_array[:, 1])
+
+        # Now clip the value channel (after saturation calc uses unclipped version)
+        np.clip(self.hsv_array[:, 2], 0.0, 1.0, out=self.hsv_array[:, 2])
+
+    def _create_drop(self, position, height):
+        self._buffer[0][position] = self._buffer[0][position - 1] = self._buffer[0][
+            position + 1
+        ] = height
+        self._buffer[1][position] = self._buffer[1][position - 1] = self._buffer[1][
+            position + 1
+        ] = height
+
+    def _do_ripple(self, buf, buf_idx, damp_factor):
+        """Apply ripple algorithm to the given buffer
+
+        Arguments:
+            buf: the double buffer to operate on
+            buf_idx: the current destination buffer.
+            damp_factor: the viscocity of the liquid.  Higher is less viscous.
+        """
+
+        src = 1 if buf_idx == 0 else 0
+        dest = 0 if buf_idx == 0 else 1
+
+        # The 2D version of this algorithm uses the north and south neighbors.
+        # Since we don't have that here, I dropped in the value at the current
+        # position.  This slows down the waves somewhat and still looks nice.
+        # Vectorized implementation - MUCH faster than Python for loop
+        buf[dest][1:-1] = (
+            (buf[src][:-2] + buf[src][2:] + buf[src][1:-1] * 2) / 2
+        ) - buf[dest][1:-1]
+
+        buf[dest] = smooth(buf[dest], 1.0)
+        buf[dest] -= buf[dest] / damp_factor

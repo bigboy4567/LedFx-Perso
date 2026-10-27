@@ -1,0 +1,703 @@
+import asyncio
+import logging
+import os
+import time
+import uuid
+import warnings
+import webbrowser
+from concurrent.futures import ThreadPoolExecutor
+from typing import ClassVar
+
+import numpy as np
+import pybase64
+from audio_hotplug import create_monitor
+
+from ledfx.configuration.models import LedFxConfig
+from ledfx.configuration.paths import (
+    VISUALISATION_CONFIG_KEYS,
+    Transmission,
+    get_ssl_certs,
+)
+from ledfx.configuration.store import ConfigStore, backup_config_file
+from ledfx.consts import PROJECT_VERSION
+from ledfx.devices import Devices
+from ledfx.effects import Effects
+from ledfx.effects.audio import AudioAnalysisSource, AudioInputSource
+from ledfx.errors import SafeMode
+from ledfx.events import (
+    AudioDeviceListChangedEvent,
+    Event,
+    Events,
+    LedFxShutdownEvent,
+    VirtualUpdateEvent,
+    VisualisationUpdateEvent,
+)
+from ledfx.http_manager import HttpServer
+from ledfx.integrations import Integrations
+from ledfx.mdns_manager import ZeroConfRunner
+from ledfx.nowplaying import NowPlayingService
+from ledfx.nowplaying.providers.mpris import MPRISNowPlayingProvider
+from ledfx.nowplaying.providers.smtc import SMTCNowPlayingProvider
+from ledfx.playlists import PlaylistManager
+from ledfx.scenes import Scenes
+from ledfx.sendspin.config import eager_start as sendspin_eager_start
+from ledfx.silence_scene import SilenceSceneController, StartupRecoveryOutcome
+from ledfx.utils import (
+    RollingQueueHandler,
+    UpdateChecker,
+    async_fire_and_forget,
+    build_user_collections,
+    currently_frozen,
+    get_sorted_physical_ips,
+    init_image_cache,
+    pixels_boost,
+    resize_pixels,
+    shape_to_fit_len,
+)
+from ledfx.virtuals import Virtuals
+
+_LOGGER = logging.getLogger(__name__)
+
+if currently_frozen():
+    warnings.filterwarnings("ignore")
+
+
+class LedFxCore:
+    EXIT_CODES: ClassVar[dict[int, str]] = {
+        1: "LedFx encountered an error - Shutting down.",
+        2: "Keyboard interrupt - Shutting down.",
+        3: "Shutdown request via API - Shutting down.",
+        4: "Restart request via API - Restarting.",
+        5: "Shutdown request via CI testing flag - Shutting down.",
+    }
+
+    def __init__(
+        self,
+        config_dir,
+        host=None,
+        port=None,
+        port_s=None,
+        icon=None,
+        ci_testing=False,
+        clear_config=False,
+        clear_effects=False,
+        offline_mode=False,
+    ):
+
+        self.audio: AudioAnalysisSource | None = None
+        self.silence_scene: SilenceSceneController | None = None
+        self.icon = icon
+        self.config_dir = config_dir
+
+        if clear_config:
+            _LOGGER.warning("Clearing LedFx config.")
+            backup_config_file(config_dir, "DELETE", move=True)
+
+        self.config_store = ConfigStore.load(config_dir)
+        if not self.config.instance_id:
+            self.config.instance_id = str(uuid.uuid4())
+        self.hosts = get_sorted_physical_ips()
+        if clear_effects:
+            _LOGGER.warning("Clearing active effects.")
+            for virtual in self.config.virtuals:
+                virtual.effect = None
+        self.host = host if host else self.config.host
+        self.port = port if port else self.config.port
+        self.port_s = port_s if port_s else self.config.port_s
+        self.ci_testing = ci_testing
+        self.offline_mode = offline_mode
+
+        self.loop = asyncio.new_event_loop()
+        _LOGGER.info("Using standard asyncio loop")
+
+        self.thread_executor = ThreadPoolExecutor()
+        self.loop.set_default_executor(self.thread_executor)
+        self.loop.set_exception_handler(self.loop_exception_handler)
+        asyncio.set_event_loop(self.loop)
+        self.config_store.attach_loop(self.loop)
+
+        # Audio device monitor will be started after loop is running
+        self.audio_device_monitor = None
+        self._mpris_now_playing = None
+        self._smtc_now_playing = None
+
+        if self.config.debug_asyncio:
+            self.loop.set_debug(True)
+
+        if self.icon:
+            self.setup_icon_menu()
+
+        self.setup_logqueue()
+        self.events = Events(self)
+        self.setup_visualisation_events()
+        self.events.add_listener(
+            self.handle_base_configuration_update, Event.BASE_CONFIG_UPDATE
+        )
+        self.http = HttpServer(
+            ledfx=self, host=self.host, port=self.port, port_s=self.port_s
+        )
+
+        self.exit_code = None
+
+    @property
+    def config(self) -> LedFxConfig:
+        """The live configuration (owned by config_store)."""
+        return self.config_store.data
+
+    def handle_base_configuration_update(self, event):
+        """
+        Handles the update of the base configuration where there are specific things that need to be done.
+
+        Currently handles visualisation configuration (requires new event listeners)
+        and sendspin_always_on runtime updates (via centralized reconcile logic).
+
+        Args:
+            event (Event): The event that triggered the update - this will always be a BaseConfigUpdateEvent.
+        """
+        _LOGGER.debug("Handling base configuration update.")
+        if any(key in event.config for key in VISUALISATION_CONFIG_KEYS):
+            _LOGGER.debug(
+                "Visualisation configuration updated - resetting visualisation event listeners."
+            )
+            self.setup_visualisation_events()
+
+        if "sendspin_always_on" in event.config:
+            self.reconcile_sendspin_always_on_runtime("base_config_update")
+
+    def reconcile_sendspin_always_on_runtime(self, trigger: str):
+        """Reconcile runtime Sendspin always-on behavior from current config.
+
+        This centralizes policy decisions so API/config/server hooks only need
+        to signal *when* to re-check, not duplicate *what* to do.
+        """
+        if self.config.sendspin_always_on:
+            _LOGGER.debug(
+                "sendspin reconcile (%s): always-on enabled, checking eager start.",
+                trigger,
+            )
+            try:
+                sendspin_eager_start(self)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning("sendspin reconcile (%s) failed: %s", trigger, exc)
+            return
+
+        if hasattr(self, "audio") and self.audio is not None:
+            _LOGGER.debug(
+                "sendspin reconcile (%s): always-on disabled, checking deactivate.",
+                trigger,
+            )
+            self.audio.check_and_deactivate()
+
+    def dev_enabled(self):
+        return self.config.dev_mode
+
+    def _start_audio_device_monitor(self):
+        """Start the audio device monitor for the current platform."""
+        try:
+            self.audio_device_monitor = create_monitor(loop=self.loop, debounce_ms=200)
+            if self.audio_device_monitor:
+                # Start monitoring with callback to refresh device list
+                self.audio_device_monitor.start(self._on_audio_devices_changed)
+                _LOGGER.info("Audio device monitor enabled")
+            else:
+                _LOGGER.debug("Audio device monitoring not available on this platform")
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.warning(
+                "Failed to start audio device monitor: %s. "
+                "Device list will not update automatically when devices are added/removed.",
+                e,
+            )
+
+    def _on_audio_devices_changed(self):
+        """
+        Callback for audio-hotplug library when device changes detected.
+
+        Delegates all audio recovery logic to AudioInputSource.handle_device_list_change()
+        to keep audio lifecycle management in one place.
+        """
+        # Let AudioInputSource handle the full lifecycle: stop, refresh, recover, restart
+        if hasattr(self, "audio") and self.audio:
+            self.audio.handle_device_list_change()
+        else:
+            # If no audio instance yet, just refresh the device list
+            AudioInputSource.refresh_device_list()
+
+        # Fire LedFx event for any listeners (e.g., websocket notifications)
+        self.events.fire_event(AudioDeviceListChangedEvent())
+
+        _LOGGER.info("Audio device list updated in response to system change")
+
+    def _load_sendspin_servers(self):
+        """Load Sendspin server configurations from config into the audio system."""
+        from ledfx.sendspin import SENDSPIN_AVAILABLE
+
+        if not SENDSPIN_AVAILABLE:
+            return
+
+        from ledfx.effects.audio import SENDSPIN_SERVERS, AudioInputSource
+
+        previous_valid = AudioInputSource.valid_device_indexes()
+
+        sendspin_config = self.config.sendspin_servers
+        SENDSPIN_SERVERS.clear()
+        for name, config in sendspin_config.items():
+            SENDSPIN_SERVERS[name] = config.model_dump()
+            _LOGGER.info("Sendspin server configured: %s", name)
+
+        if sendspin_config:
+            _LOGGER.info("Loaded %d Sendspin server(s)", len(sendspin_config))
+
+        # Log what the audio system sees immediately after loading
+        try:
+            valid = AudioInputSource.valid_device_indexes()
+            _LOGGER.debug(
+                "_load_sendspin_servers: valid_device_indexes after load = %s",
+                valid,
+            )
+
+            if valid != previous_valid:
+                self.events.fire_event(AudioDeviceListChangedEvent())
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("_load_sendspin_servers: could not query devices: %s", exc)
+
+        # Runtime path: server changes can alter whether the configured
+        # Sendspin source is currently available.
+        self.reconcile_sendspin_always_on_runtime("sendspin_servers_loaded")
+
+    def loop_exception_handler(self, loop, context):
+        kwargs = {}
+        exception = context.get("exception")
+        if exception:
+            kwargs["exc_info"] = (
+                type(exception),
+                exception,
+                exception.__traceback__,
+            )
+
+        _LOGGER.error(
+            "Exception in core event loop: %s",
+            context["message"],
+            **kwargs,
+        )
+
+    def open_ui(self):
+        # Check if we're binding to all adaptors
+        if str(self.config.host) == "0.0.0.0":
+            url = f"http://127.0.0.1:{self.port!s}"
+        else:
+            # If the user has specified an adaptor, launch its address
+            url = self.http.base_url
+        try:
+            webbrowser.get().open(url)
+        except webbrowser.Error:
+            _LOGGER.warning(
+                "Failed to open default web browser. To access LedFx's web ui, open %s in your browser.",
+                url,
+            )
+
+    def setup_icon_menu(self):
+        import pystray
+
+        self.icon.menu = pystray.Menu(
+            pystray.MenuItem(f"LedFx - {PROJECT_VERSION}", None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Open", self.open_ui, default=True),
+            pystray.MenuItem("Check for Update", self.check_and_notify_updates),
+            pystray.MenuItem("Quit Ledfx", self.stop),
+        )
+
+    def setup_visualisation_events(self):
+        """
+        creates event listeners to fire visualisation events at
+        a given rate
+        """
+        # Remove existing listeners if they exist
+        if hasattr(self, "visualisation_update_listener"):
+            _LOGGER.debug(
+                "Removing existing visualisation event handler and event listeners."
+            )
+            self.visualisation_update_listener = None
+            self.virtual_listener()
+            self.device_listener()
+
+        min_time_since = 1 / self.config.visualisation_fps
+        next_update: dict[str, float] = {}
+        max_len = self.config.visualisation_maxlen
+
+        def handle_visualisation_update(event):
+            if not self.events.has_listeners(Event.VISUALISATION_UPDATE):
+                return
+            is_device = event.event_type == Event.DEVICE_UPDATE
+            time_now = time.monotonic()
+
+            if is_device:
+                vis_id = event.device_id
+            else:
+                vis_id = event.virtual_id
+
+            due = next_update.get(vis_id, time_now)
+            if time_now < due:
+                return
+            # Advance the schedule, not the arrival time. Resetting to now
+            # makes e.g. a 62 Hz source lose every other 60 Hz preview. Skip
+            # missed slots after stalls and never replay a burst of old frames.
+            next_update[vis_id] = (
+                time_now + min_time_since - (time_now - due) % min_time_since
+            )
+
+            # Prefer dimensions captured with the frame. The virtual may have
+            # been deactivated before this deferred event is handled.
+            virtual = self.virtuals.get(vis_id)
+            rows = event.rows if isinstance(event, VirtualUpdateEvent) else None
+            if rows is None:
+                rows = virtual.rows if virtual else 1
+            rows = max(1, rows)
+
+            pixels = event.pixels
+            pixels_len = len(pixels)
+            shape = (rows, int(pixels_len / rows))
+
+            if pixels_len > max_len:
+                new_shape, pixels_len = shape_to_fit_len(max_len, shape, pixels_len)
+                pixels = resize_pixels(pixels[:pixels_len], shape, new_shape)
+                shape = new_shape
+
+            if self.config.ui_brightness_boost != 0:
+                pixels = pixels_boost(pixels, self.config.ui_brightness_boost, 100)
+
+            if self.config.transmission_mode == Transmission.BASE64_COMPRESSED:
+                b_arr = pixels.astype(np.uint8, copy=False).tobytes()
+                pixels = pybase64.b64encode(b_arr).decode("ASCII")
+            else:
+                pixels = pixels.astype(np.uint8).T.tolist()
+
+            self.events.fire_event(
+                VisualisationUpdateEvent(is_device, vis_id, pixels, shape)
+            )
+
+        _LOGGER.debug("Setting up visualisation event handler.")
+        self.visualisation_update_listener = handle_visualisation_update
+        _LOGGER.debug("Adding virtual update event listener.")
+        self.virtual_listener = self.events.add_listener(
+            self.visualisation_update_listener,
+            Event.VIRTUAL_UPDATE,
+        )
+        _LOGGER.debug("Adding device update event listener.")
+        self.device_listener = self.events.add_listener(
+            self.visualisation_update_listener,
+            Event.DEVICE_UPDATE,
+        )
+
+    def setup_logqueue(self):
+        def log_filter(record):
+            return (record.name != "ledfx.api.log") and (record.levelno >= 20)
+
+        self.logqueue = asyncio.Queue(maxsize=100)
+        logqueue_handler = RollingQueueHandler(self.logqueue)
+        logqueue_handler.addFilter(log_filter)
+        root_logger = logging.getLogger()
+        root_logger.addHandler(logqueue_handler)
+
+    def check_and_notify_updates(self, show_check_notification=None):
+        """
+        Checks for updates of LedFx and notifies the user if a new version is available.
+
+        Args:
+            show_check_notification (object): An optional parameter that is never called with any specific value.
+                When called via pystray, it is an icon object. This behavior is unintended but functional.
+
+        Returns:
+            None
+
+        Raises:
+            None
+        """
+
+        if show_check_notification and self.icon and self.icon.HAS_NOTIFICATION:
+            self.icon.notify("Checking for updates...", "LedFx")
+        is_release = os.getenv("IS_RELEASE", "false").lower()
+        if is_release == "false":
+            _LOGGER.info("Not checking for updates - not a release.")
+            return
+        _LOGGER.info("Checking for updates...")
+        if UpdateChecker.get_release_information():
+            if UpdateChecker.update_available():
+                latest_version = UpdateChecker.get_latest_version()
+                release_url = UpdateChecker.get_release_url()
+                _LOGGER.warning(
+                    "New version of LedFx available: %s - %s",
+                    latest_version,
+                    release_url,
+                )
+
+                if self.icon and self.icon.HAS_NOTIFICATION:
+                    self.icon.notify(
+                        f"New version of LedFx available: {latest_version}",
+                        "LedFx",
+                    )
+                    try:
+                        webbrowser.get().open(release_url)
+                    except webbrowser.Error:
+                        pass
+            else:
+                _LOGGER.info("LedFx is up to date.")
+        else:
+            _LOGGER.warning("Unable to get update information.")
+            if show_check_notification and self.icon and self.icon.HAS_NOTIFICATION:
+                self.icon.notify("Unable to get update information", "LedFx")
+
+    def _startup_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self.loop_exception_handler(
+                self.loop, {"message": "LedFx startup failed", "exception": error}
+            )
+            self.stop(1)
+
+    def start(self, open_ui=False, pause_all=False):
+        async_fire_and_forget(
+            self.async_start(open_ui=open_ui, pause_all=pause_all),
+            self.loop,
+            exc_handler=self._startup_done,
+        )
+
+        try:
+            self.loop.run_forever()
+        except KeyboardInterrupt:
+            self.loop.call_soon(self.loop.create_task, self.async_stop(exit_code=2))
+            self.loop.run_forever()
+        except BaseException:  # noqa: BLE001
+            # Catch all other exceptions and terminate the application. The loop
+            # exception handler will take care of logging the actual error and
+            # LedFx will cleanly shutdown.
+            self.loop.run_until_complete(self.async_stop(exit_code=1))
+        finally:
+            self.loop.stop()
+
+        return self.exit_code
+
+    async def async_start(self, open_ui=False, pause_all=False):
+        _LOGGER.info("Starting LedFx, listening on %s:%s", self.host, self.port)
+
+        if (
+            self.icon is not None
+            and self.icon.notify is not None
+            and self.icon.HAS_NOTIFICATION
+        ):
+            self.icon.notify(
+                "Started in background.\nUse the tray icon to open.", "LedFx"
+            )
+
+        # Initialize image cache
+        cache_config = self.config.image_cache
+        init_image_cache(
+            self.config_dir,
+            max_size_mb=cache_config.max_size_mb,
+            max_items=cache_config.max_items,
+        )
+
+        self.devices = Devices(self)
+        self.effects = Effects(self)
+        self.virtuals = Virtuals(self)
+        # Ensure we start with a fresh virtual registry when reusing the
+        # Virtuals singleton across LedFxCore lifecycles.
+        self.virtuals.reset_for_core(self)
+        self.integrations = Integrations(self)
+        self.scenes = Scenes(self)
+        self.playlists = PlaylistManager(self)
+        self.silence_scene = SilenceSceneController(self)
+        self.colors, self.gradients = build_user_collections(self)
+
+        # Now Playing drives virtuals through the manager, so it starts once
+        # virtuals, effects and gradients exist (Sendspin may push metadata
+        # while virtuals load, below).
+        self.now_playing = NowPlayingService(self)
+
+        # Start SMTC Now Playing provider (Windows-only; no-op elsewhere)
+        self._smtc_now_playing = SMTCNowPlayingProvider(self)
+        self._smtc_now_playing.start()
+
+        # Start MPRIS Now Playing provider (Linux-only; no-op elsewhere)
+        self._mpris_now_playing = MPRISNowPlayingProvider(self)
+        self._mpris_now_playing.start()
+
+        # TODO: Deferr
+        self.devices.create_from_config(self.config.devices)
+        await self.devices.async_initialize_devices()
+
+        # Load Sendspin server configurations into audio system BEFORE
+        # virtuals, since virtuals with active effects trigger audio
+        # initialization which validates the audio_device index.
+        self._load_sendspin_servers()
+
+        self.zeroconf = ZeroConfRunner(ledfx=self)
+        self.virtuals.create_from_config(self.config.virtuals, pause_all=pause_all)
+        self.integrations.create_from_config(self.config.integrations)
+
+        # Start the HTTP server once internal registries are initialized so
+        # websockets and REST endpoints are fully ready before the UI opens.
+        await self.http.start(get_ssl_certs(config_dir=self.config_dir))
+
+        # Start audio device monitor for OS-level device change notifications
+        self._start_audio_device_monitor()
+
+        # Only open the UI once devices and virtuals have been initialized
+        if open_ui:
+            self.open_ui()
+
+        if self.config.scan_on_startup:
+            async_fire_and_forget(self.zeroconf.discover_wled_devices(), self.loop)
+
+        async_fire_and_forget(self.integrations.activate_integrations(), self.loop)
+
+        if self.ci_testing:
+            # Frozen/Docker jobs must load and exercise the shipped extension.
+            # Capture mode never opens a socket or contacts a physical receiver.
+            from ledfx_senders import E131Sender
+            from ledfx_senders.e131 import ChannelLayout
+
+            sender = E131Sender._test_sender(
+                ChannelLayout(3),
+                destination="multicast",
+                source_name="ci-smoke",
+                mode="capture",
+            )
+            try:
+                sender.send(bytes([12, 13, 14]))
+                packets = sender._engine.captures()
+                if len(packets) != 2 or packets[0][0][126:129] != bytes([12, 13, 14]):
+                    raise RuntimeError("Native E1.31 smoke check failed")
+            finally:
+                sender.close(False)
+            _LOGGER.info("Native E1.31 capture smoke passed")
+            await asyncio.sleep(5)
+            self.stop(5)
+        if not self.offline_mode:
+            # The check makes a blocking HTTP request.
+            await asyncio.to_thread(self.check_and_notify_updates)
+
+        recovery_outcome = await self.silence_scene.recover_startup()
+        if recovery_outcome == StartupRecoveryOutcome.NO_RECOVERY:
+            self._activate_startup_scene()
+            await self._handle_startup_playlist()
+        if self.silence_scene.state in ("normal", "recovery_failed"):
+            self.silence_scene.start_monitoring()
+
+        if pause_all:
+            # pause at the virtuals level
+            self.virtuals.pause_all()
+
+    def _activate_startup_scene(self) -> None:
+        """Activate the configured startup scene, if any (skipped in safe mode)."""
+        if self.config.startup_scene_id == "":
+            return
+        try:
+            activated = self.scenes.activate(self.config.startup_scene_id)
+        except SafeMode:
+            _LOGGER.debug("startup_scene_id not activated: safe mode")
+            return
+        if activated:
+            _LOGGER.info(
+                "startup_scene_id; %s activated.", self.config.startup_scene_id
+            )
+        else:
+            _LOGGER.warning(
+                "startup_scene_id: %s not found.", self.config.startup_scene_id
+            )
+
+    async def _handle_startup_playlist(self):
+        """Activate the configured startup playlist, if any."""
+        if self.config.startup_playlist_id != "":
+            pid = self.config.startup_playlist_id
+            if await self.playlists.start(pid):
+                _LOGGER.info(
+                    "startup_playlist_id: %s started.",
+                    pid,
+                )
+            else:
+                _LOGGER.warning(
+                    "startup_playlist_id: %s could not be started.",
+                    pid,
+                )
+
+    def stop(self, exit_code):
+        async_fire_and_forget(self.async_stop(exit_code), self.loop)
+
+    async def async_stop(self, exit_code):
+        if not self.loop:
+            return
+
+        _LOGGER.info("Stopping LedFx.")
+        try:
+            try:
+                _LOGGER.info(self.EXIT_CODES.get(exit_code, "Unknown exit code."))
+                # Fire a shutdown event
+                self.events.fire_event(LedFxShutdownEvent())
+
+                # Stop audio device monitor
+                if self.audio_device_monitor:
+                    try:
+                        self.audio_device_monitor.stop()
+                    except Exception as e:  # noqa: BLE001
+                        _LOGGER.warning("Error stopping audio device monitor: %s", e)
+
+                if self._smtc_now_playing is not None:
+                    try:
+                        self._smtc_now_playing.stop()
+                    except Exception as e:  # noqa: BLE001
+                        _LOGGER.warning("Error stopping SMTC provider: %s", e)
+
+                if self._mpris_now_playing is not None:
+                    try:
+                        self._mpris_now_playing.stop()
+                    except Exception as e:  # noqa: BLE001
+                        _LOGGER.warning("Error stopping MPRIS provider: %s", e)
+
+                _LOGGER.info("Stopping HTTP Server...")
+                await self.http.stop()
+
+            finally:
+                # Device-owned work must drain even if an earlier shutdown
+                # operation failed, while its executor is still available.
+                # async_start creates the registry; earlier startup failures can
+                # reach shutdown before there are any devices to drain.
+                devices = getattr(self, "devices", None)
+                if devices is not None:
+                    await devices.async_shutdown_devices()
+
+            # Cancel all the remaining task and wait
+            tasks = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task()
+            ]
+            if tasks:
+                _LOGGER.debug("Killing %s tasks prior to shutdown...", len(tasks))
+                # Cancel all tasks concurrently
+                group = asyncio.gather(*tasks, return_exceptions=True)
+                group.cancel()
+                # Wait for all tasks to be cancelled
+                try:
+                    await group
+                except asyncio.CancelledError:
+                    pass
+                _LOGGER.debug("All tasks killed.")
+
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.error("An error occurred while stopping: %s", e)
+            self.exit_code = 1
+
+        finally:
+            # Write any debounced change, even if shutdown above failed.
+            try:
+                self.config_store.flush_sync()
+            except Exception:  # must not skip loop.stop() below
+                _LOGGER.exception("Failed to flush config on shutdown")
+            self.thread_executor.shutdown()
+            # Don't overwrite error exit code
+            if self.exit_code != 1:
+                self.exit_code = exit_code
+            self.loop.stop()
+            return exit_code  # noqa: B012

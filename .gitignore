@@ -1,0 +1,93 @@
+# Temporary and binary files
+*~
+*.py[cod]
+*.so
+*.cfg
+!setup.cfg
+*.orig
+*.log
+*.pot
+.cache/*
+.*.swp
+*/.ipynb_checkpoints/*
+*.DS_Store
+
+# Python env
+env
+.venv
+
+# NPM
+node_modules/
+npm-debug.log
+package-lock.json
+
+# Project files
+.ropeproject
+.project
+.pydevproject
+.settings
+.idea
+*.code-workspace
+
+# Package files
+*.egg
+*.eggs/
+.installed.cfg
+*.egg-info
+
+# Unittest and coverage
+htmlcov/*
+.coverage
+.tox
+junit.xml
+coverage.xml
+
+# Build and docs folder/files
+build/*
+dist/*
+sdist/*
+docs/api/*
+docs/_build/*
+docs/build/*
+cover/*
+MANIFEST
+
+
+# LedFx helper functions leave these files behind
+performance_analysis.csv
+performance_insights.txt
+
+# Debugging task may leave this folder behind if it crashes
+debug_config
+# spec file build may leave the ledfx.env behind
+ledfx.env
+# Misc
+.devcontainer/ledfx-config.yml
+frontend/*.eslintcache
+*.eslintcache
+
+
+#Pycache from numba
+__pycache__/
+*.pyc
+
+# Setups
+/installer/*
+!/installer/ledfx.nsi
+!/installer/icons
+!/installer/icons/**
+
+# AI stuff
+.claude/
+
+# Local design docs (superpowers specs/plans) — never committed
+docs/superpowers/
+
+# Hypothesis (schemathesis contract tests) writes here
+.hypothesis/
+
+# Local setup of this fork: the user's own config, logs and the phone remote's
+# HTTPS keys (dev_config\ssl) must never be published
+/dev_config/
+.ruff_cache/
+.pdm-build/

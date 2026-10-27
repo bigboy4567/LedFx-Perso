@@ -1,0 +1,758 @@
+import logging
+
+import numpy as np
+from lifx import (
+    HSBK,
+    Animator,
+    CeilingLight,
+    HevLight,
+    InfraredLight,
+    LifxError,
+    Light,
+    MatrixLight,
+    MirrorLight,
+    MultiZoneLight,
+    find_by_ip,
+)
+from lifx.const import LIFX_UDP_PORT
+from lifx.exceptions import LifxTimeoutError
+from lifx.protocol import packets
+from pydantic import Field
+
+from ledfx.configuration.fields import Fps
+from ledfx.configuration.plugin import TypedConfig
+from ledfx.devices import NetworkedDevice
+from ledfx.utils import AVAILABLE_FPS, async_fire_and_forget, generate_id
+
+_LOGGER = logging.getLogger(__name__)
+
+
+# Max refresh rate for single bulbs (prevents strobing)
+MAX_FPS_LIGHT = 20
+
+# Map lifx-async device types to internal type identifiers
+LIFX_TYPE_MAP = {
+    "Light": "light",
+    "HevLight": "light",
+    "InfraredLight": "light",
+    "MultiZoneLight": "strip",
+    "MatrixLight": "matrix",
+    "CeilingLight": "matrix",
+    "MirrorLight": "mirror",
+    "Device": "light",  # Fallback
+}
+
+# Map class names to lifx-async device classes for direct instantiation
+LIFX_CLASS_MAP = {
+    "MatrixLight": MatrixLight,
+    "CeilingLight": CeilingLight,
+    "MirrorLight": MirrorLight,
+    "MultiZoneLight": MultiZoneLight,
+    "Light": Light,
+    "HevLight": HevLight,
+    "InfraredLight": InfraredLight,
+}
+
+
+def numpy_rgb_to_hsbk(rgb_array: np.ndarray, kelvin: int = 3500) -> list:
+    """Convert NumPy RGB array to protocol-ready HSBK list.
+
+    Args:
+        rgb_array: Shape (N, 3) with RGB values 0-255
+        kelvin: Color temperature
+
+    Returns:
+        List of (hue, sat, bright, kelvin) tuples for send_frame()
+    """
+    rgb_norm = rgb_array.astype(np.float32) / 255.0
+    r, g, b = rgb_norm[:, 0], rgb_norm[:, 1], rgb_norm[:, 2]
+
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    delta = maxc - minc
+
+    v = maxc  # Brightness
+    s = np.zeros_like(maxc)
+    np.divide(delta, maxc, out=s, where=maxc > 0)  # Saturation
+
+    h = np.zeros_like(r)
+    mask = delta > 0
+
+    red_max = mask & (maxc == r)
+    h[red_max] = ((g[red_max] - b[red_max]) / delta[red_max]) % 6
+
+    green_max = mask & (maxc == g)
+    h[green_max] = (b[green_max] - r[green_max]) / delta[green_max] + 2
+
+    blue_max = mask & (maxc == b)
+    h[blue_max] = (r[blue_max] - g[blue_max]) / delta[blue_max] + 4
+
+    h = h / 6  # Normalize to 0-1
+
+    hue_proto = (h * 65535).astype(np.uint16)
+    sat_proto = (s * 65535).astype(np.uint16)
+    bright_proto = (v * 65535).astype(np.uint16)
+
+    return [
+        (int(hue_proto[i]), int(sat_proto[i]), int(bright_proto[i]), kelvin)
+        for i in range(len(rgb_array))
+    ]
+
+
+class LifxDevice(NetworkedDevice):
+    """Unified LIFX device with auto-detection.
+
+    Automatically detects device type (bulb, strip, matrix, or mirror) on
+    connection and configures itself appropriately. Users only need to provide
+    an IP.
+
+    The LIFX Mirror reports a 4x13 matrix, but its buffer interleaves two
+    closed rings (front and back) rather than forming a spatial grid. LedFx
+    drives it as a 50-pixel strip (front zones 0-24, then back zones 49-25)
+    and scatters each frame into the device buffer on flush. The back ring is
+    reversed because it runs the opposite way to the front, so both rings
+    animate in the same direction.
+    When a Mirror is added, a "Front" and a "Back" 25-pixel strip virtual are
+    created so each ring can run its own effect.
+    """
+
+    class Config(NetworkedDevice.Config):
+        pixel_count: int = Field(
+            1, description="Number of pixels (auto-detected on connect)", ge=1
+        )
+        refresh_rate: Fps = Field(
+            next(
+                (f for f in AVAILABLE_FPS if f >= 30),
+                list(AVAILABLE_FPS)[-1],
+            ),
+            description="Target rate that pixels are sent to the device",
+        )
+
+    config = TypedConfig(Config)
+
+    def __init__(self, ledfx, config):
+        super().__init__(ledfx, config)
+        self._device_type = "LIFX"
+        self._device = None  # The lifx-async device object
+        self._lifx_type = None  # "light", "strip", or "matrix"
+        self._connected = False
+
+        # Strip-specific
+        self._zone_count = 1
+        self._has_extended = False
+
+        # Matrix-specific
+        self._tiles = []
+        self._total_pixels = self.config.pixel_count
+        self._matrix_width = 0
+        self._matrix_height = 0
+        self._perm = None
+
+        # Mirror-specific: buffer position of each strip pixel
+        self._mirror_positions: np.ndarray | None = None
+        self._front_zone_count = 0
+
+        # Animation module for matrix/strip (high performance)
+        self._animator = None
+
+    @property
+    def _port(self) -> int:
+        """The device's UDP port.
+
+        Deliberately not a schema field: real LIFX devices always listen
+        on 56700. The test suite sets it to reach an emulator bound to an
+        OS-assigned port.
+        """
+        return getattr(self.config, "port", LIFX_UDP_PORT)
+
+    async def async_initialize(self):
+        """Initialize device and auto-detect type during creation."""
+        await super().async_initialize()
+        await self._detect_device_type()
+
+        # Update virtual rows for matrix devices after detection
+        if self._lifx_type == "matrix" and self._matrix_height > 0:
+            self._update_virtual_rows()
+
+    async def _detect_device_type(self):
+        """Detect LIFX device type and update config accordingly."""
+        try:
+            ip = self.config.ip_address
+            device = await find_by_ip(ip=ip, port=self._port)
+
+            if device is None:
+                _LOGGER.warning(
+                    "LIFX %s: No device found at %s during detection",
+                    self.config.name,
+                    ip,
+                )
+                return
+
+            async with device:
+                # Save serial, class, and type for faster future connections
+                lifx_class = type(device).__name__
+                self._lifx_type = LIFX_TYPE_MAP.get(lifx_class, "light")
+                self._set_config_values(
+                    serial=device.serial,
+                    lifx_class=lifx_class,
+                    lifx_type=self._lifx_type,
+                )
+
+                _LOGGER.info(
+                    "LIFX %s: Detected %s (%s) serial=%s",
+                    self.config.name,
+                    lifx_class,
+                    self._lifx_type,
+                    device.serial,
+                )
+
+                # Get device info based on type
+                # CeilingLight and MirrorLight are subclasses of MatrixLight
+                if isinstance(device, MirrorLight):
+                    self._lifx_type = "mirror"
+                    self._device_type = "LIFX Mirror"
+                    self._zone_count = device.layout.zone_count
+                    self._set_config_values(pixel_count=self._zone_count)
+                    self._front_zone_count = device.front_zone_count
+                    _LOGGER.info(
+                        "LIFX %s: Mirror with %d zones (front %d, back %d)",
+                        self.config.name,
+                        self._zone_count,
+                        device.front_zone_count,
+                        device.back_zone_count,
+                    )
+
+                elif isinstance(device, MatrixLight):
+                    self._lifx_type = "matrix"
+                    self._device_type = "LIFX Matrix"
+                    tiles = await device.get_device_chain()
+                    self._tiles, self._total_pixels = self._collect_tile_info(tiles)
+
+                    if self._tiles:
+                        self._perm = self._build_permutation(tiles)
+                        self._set_config_values(
+                            pixel_count=self._total_pixels,
+                            matrix_width=self._matrix_width,
+                            matrix_height=self._matrix_height,
+                        )
+                        _LOGGER.info(
+                            "LIFX %s: Matrix %dx%d (%d pixels)",
+                            self.config.name,
+                            self._matrix_width,
+                            self._matrix_height,
+                            self._total_pixels,
+                        )
+                    else:
+                        _LOGGER.warning(
+                            "LIFX %s: Matrix device returned no tiles",
+                            self.config.name,
+                        )
+
+                elif isinstance(device, MultiZoneLight):
+                    self._lifx_type = "strip"
+                    self._device_type = "LIFX Strip"
+                    self._zone_count = await device.get_zone_count()
+                    self._set_config_values(pixel_count=self._zone_count)
+
+                    if not device.capabilities:
+                        await device._ensure_capabilities()
+                    if (
+                        device.capabilities
+                        and device.capabilities.has_extended_multizone
+                    ):
+                        self._has_extended = True
+
+                    _LOGGER.info(
+                        "LIFX %s: Strip with %d zones (extended=%s)",
+                        self.config.name,
+                        self._zone_count,
+                        self._has_extended,
+                    )
+
+                elif isinstance(device, (Light, HevLight, InfraredLight)):
+                    self._lifx_type = "light"
+                    self._device_type = "LIFX Light"
+                    self._set_config_values(pixel_count=1)
+                    _LOGGER.info("LIFX %s: Single bulb", self.config.name)
+
+        except (LifxError, OSError) as e:
+            _LOGGER.warning("LIFX %s: Detection failed: %s", self.config.name, e)
+
+    async def add_postamble(self):
+        """Create a strip virtual for each ring of a LIFX Mirror."""
+        if self._lifx_type != "mirror" or self._zone_count < 2:
+            return
+
+        front_count = self._front_zone_count or self._zone_count // 2
+        rings = (
+            ("Front", 0, front_count - 1),
+            ("Back", front_count, self._zone_count - 1),
+        )
+        for name, start, end in rings:
+            if self._ledfx.virtuals.get(generate_id(f"{self.name}-{name}")):
+                continue
+            self.sub_v(name, "mdi:mirror", [[start, end]], 1)
+
+    @property
+    def pixel_count(self):
+        if self._lifx_type == "matrix":
+            return self._total_pixels
+        elif self._lifx_type in ("strip", "mirror"):
+            return self._zone_count
+        return self.config.pixel_count
+
+    @property
+    def is_matrix(self):
+        return self._lifx_type == "matrix"
+
+    @property
+    def matrix_width(self):
+        return self._matrix_width if self._lifx_type == "matrix" else 0
+
+    @property
+    def matrix_height(self):
+        return self._matrix_height if self._lifx_type == "matrix" else 0
+
+    def _build_permutation(self, tiles):
+        """Build permutation array for matrix devices.
+
+        Maps LedFx row-major pixel order to LIFX tile layout using
+        tile position data (user_x, user_y).
+        """
+        coords = []
+        for tile in tiles:
+            tile_x = int(tile.user_x)
+            tile_y = int(tile.user_y)
+            for local_idx in range(tile.width * tile.height):
+                local_x = local_idx % tile.width
+                local_y = local_idx // tile.width
+                global_x = tile_x + local_x
+                global_y = tile_y + local_y
+                coords.append((global_x, global_y))
+
+        coords = np.array(coords, dtype=np.float32)
+
+        x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+        y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+        self._matrix_width = int(x_max - x_min + 1)
+        self._matrix_height = int(y_max - y_min + 1)
+
+        cols = (coords[:, 0] - x_min).astype(np.int32)
+        rows = (coords[:, 1] - y_min).astype(np.int32)
+
+        raster_idx = rows * self._matrix_width + cols
+        return raster_idx.astype(np.int64)
+
+    def _collect_tile_info(self, tiles):
+        """Collect tile metadata and compute total pixels.
+
+        Args:
+            tiles: List of tile objects from device.get_device_chain()
+
+        Returns:
+            Tuple of (tile_list, total_pixels)
+        """
+        tile_list = []
+        total_pixels = 0
+
+        for tile in tiles:
+            tile_pixels = tile.width * tile.height
+            tile_list.append(
+                {
+                    "index": tile.tile_index,
+                    "width": tile.width,
+                    "height": tile.height,
+                    "pixels": tile_pixels,
+                    "offset": total_pixels,
+                    "user_x": tile.user_x,
+                    "user_y": tile.user_y,
+                }
+            )
+            total_pixels += tile_pixels
+
+        return tile_list, total_pixels
+
+    async def _create_animator(self):
+        """Create Animator for high-performance frame delivery."""
+        try:
+            ip = self.config.ip_address
+            serial = getattr(self.config, "serial", None)
+
+            if self._lifx_type == "matrix":
+                # "" is no key, like a missing lifx_class: both give MatrixLight.
+                lifx_class = getattr(self.config, "lifx_class", "")
+                device_cls = LIFX_CLASS_MAP.get(lifx_class, MatrixLight)
+
+                if serial:
+                    self._device = device_cls(serial=serial, ip=ip, port=self._port)
+                else:
+                    self._device = await device_cls.from_ip(ip, port=self._port)
+
+                # This is usually handled by instantiating CeilingLight via an async context manager
+                # but for performance reasons, we instantiate directly, so we have to manually update
+                # the state before calling set_power.
+                if device_cls is CeilingLight:
+                    await self._device.refresh_state()
+
+                await self._device.set_power(True)
+
+                self._animator = await Animator.for_matrix(self._device)
+
+            elif self._lifx_type == "mirror":
+                if serial:
+                    self._device = MirrorLight(serial=serial, ip=ip, port=self._port)
+                else:
+                    self._device = await MirrorLight.from_ip(ip, port=self._port)
+
+                # set_power() initialises state, which populates the version
+                # needed to look up the component layout
+                await self._device.set_power(True)
+
+                layout = self._device.layout
+                self._zone_count = layout.zone_count
+                # The back ring runs the opposite way to the front, so
+                # reverse it: pixel k of each ring then sits in the same spot
+                self._mirror_positions = np.array(
+                    layout.front_positions + layout.back_positions[::-1],
+                    dtype=np.intp,
+                )
+                self._animator = await Animator.for_matrix(self._device)
+
+            elif self._lifx_type == "strip":
+                if serial:
+                    self._device = MultiZoneLight(serial=serial, ip=ip, port=self._port)
+                else:
+                    self._device = await MultiZoneLight.from_ip(ip, port=self._port)
+
+                await self._device.set_power(True)
+                self._animator = await Animator.for_multizone(self._device)
+
+            self._connected = True
+            self._online = True
+
+            _LOGGER.info(
+                "LIFX %s: Animator ready (%dx%d, %d pixels)",
+                self.name,
+                self._animator.canvas_width,
+                self._animator.canvas_height,
+                self._animator.pixel_count,
+            )
+
+            # Update virtual rows for matrix devices
+            if self._lifx_type == "matrix":
+                self._update_virtual_rows()
+
+        except (LifxError, LifxTimeoutError, OSError) as e:
+            _LOGGER.warning(
+                "LIFX %s: Animator creation failed: %s",
+                self.name,
+                e,
+                # An offline device is expected; only unexpected errors
+                # need a traceback
+                exc_info=not isinstance(e, LifxTimeoutError),
+            )
+            if self._device:
+                try:
+                    await self._device.close()
+                except (LifxError, OSError):
+                    _LOGGER.debug(
+                        "LIFX %s: Device close failed after animator error",
+                        self.name,
+                    )
+                self._device = None
+            self._animator = None
+            self._mirror_positions = None
+            self._connected = False
+            self._online = False
+
+    async def _async_connect(self):
+        """Connect to device using saved serial/type for speed."""
+        try:
+            ip = self.config.ip_address
+            serial = getattr(self.config, "serial", None)
+            lifx_type = getattr(self.config, "lifx_type", None)
+
+            # Use saved info for direct instantiation (faster)
+            lifx_class = getattr(self.config, "lifx_class", None)
+            if serial and lifx_type and lifx_class:
+                device_cls = LIFX_CLASS_MAP.get(lifx_class, Light)
+                self._device = device_cls(serial=serial, ip=ip, port=self._port)
+                self._lifx_type = lifx_type
+                _LOGGER.info(
+                    "LIFX %s: Direct connect as %s (%s)",
+                    self.config.name,
+                    lifx_class,
+                    lifx_type,
+                )
+            else:
+                # Fallback to discovery (slower, 2+ round trips)
+                self._device = await find_by_ip(ip=ip, port=self._port)
+                if self._device is None:
+                    _LOGGER.warning(
+                        "LIFX %s: No device found at %s",
+                        self.config.name,
+                        ip,
+                    )
+                    self._connected = False
+                    self._online = False
+                    return
+                lifx_class = type(self._device).__name__
+                self._lifx_type = LIFX_TYPE_MAP.get(lifx_class, "light")
+                _LOGGER.info(
+                    "LIFX %s: Discovery connect as %s (%s)",
+                    self.config.name,
+                    lifx_class,
+                    self._lifx_type,
+                )
+
+            # Ensure capabilities are populated (strips check extended multizone)
+            await self._device._ensure_capabilities()
+
+            # Configure based on type
+            if self._lifx_type == "matrix":
+                await self._setup_matrix()
+            elif self._lifx_type == "strip":
+                await self._setup_strip()
+            else:
+                await self._setup_light()
+
+            # Turn on device
+            await self._device.set_power(True)
+            self._connected = True
+            self._online = True
+
+            # Update virtual rows for matrix devices
+            if self._lifx_type == "matrix":
+                self._update_virtual_rows()
+
+        except (LifxError, OSError) as e:
+            _LOGGER.warning(
+                "LIFX %s: Connection failed: %s",
+                self.config.name,
+                e,
+            )
+            self._connected = False
+            self._online = False
+
+    async def _setup_light(self):
+        """Configure for single bulb device."""
+        self._device_type = "LIFX Light"
+        _LOGGER.info(
+            "LIFX %s: Configured as single bulb",
+            self.config.name,
+        )
+
+    async def _setup_strip(self):
+        """Configure for multizone strip device."""
+        if not isinstance(self._device, MultiZoneLight):
+            return
+
+        self._device_type = "LIFX Strip"
+        self._zone_count = await self._device.get_zone_count()
+
+        # Check for extended multizone capability
+        if not self._device.capabilities:
+            await self._device._ensure_capabilities()
+
+        if (
+            self._device.capabilities
+            and self._device.capabilities.has_extended_multizone
+        ):
+            self._has_extended = True
+
+        _LOGGER.info(
+            "LIFX %s: Configured as strip with %d zones (extended=%s)",
+            self.config.name,
+            self._zone_count,
+            self._has_extended,
+        )
+
+    async def _setup_matrix(self):
+        """Configure for matrix device (Tile, Ceiling, etc.)."""
+        if isinstance(self._device, (MatrixLight, CeilingLight)):
+            self._device_type = "LIFX Matrix"
+
+            # Use saved config if available (from async_initialize)
+            if self._tiles and self._perm is not None:
+                self._matrix_width = getattr(self.config, "matrix_width", 0)
+                self._matrix_height = getattr(self.config, "matrix_height", 0)
+                _LOGGER.info(
+                    "LIFX %s: Using saved matrix config %dx%d (%d pixels)",
+                    self.config.name,
+                    self._matrix_width,
+                    self._matrix_height,
+                    self._total_pixels,
+                )
+                return
+
+            # Otherwise query the device
+            tiles = await self._device.get_device_chain()
+            self._tiles, self._total_pixels = self._collect_tile_info(tiles)
+
+            if self._tiles:
+                self._perm = self._build_permutation(tiles)
+                tile_info = ", ".join(
+                    f"Tile {t['index']}: {t['width']}x{t['height']} "
+                    f"@({t['user_x']},{t['user_y']})"
+                    for t in self._tiles
+                )
+                _LOGGER.info(
+                    "LIFX %s: Matrix %dx%d (%d pixels) [%s]",
+                    self.config.name,
+                    self._matrix_width,
+                    self._matrix_height,
+                    self._total_pixels,
+                    tile_info,
+                )
+            else:
+                _LOGGER.warning(
+                    "LIFX %s: Matrix device returned no tiles",
+                    self.config.name,
+                )
+
+    def _update_virtual_rows(self):
+        """Update associated virtual's rows to match matrix height."""
+        for virtual in self._ledfx.virtuals.values():
+            if virtual.is_device == self.id:
+                if virtual.config.rows != self._matrix_height:
+                    _LOGGER.info(
+                        "Updating virtual %s rows %d -> %d",
+                        virtual.id,
+                        virtual.config.rows,
+                        self._matrix_height,
+                    )
+                    virtual.update_config({"rows": self._matrix_height})
+                break
+
+    async def _async_disconnect(self):
+        """Disconnect from device."""
+        if self._device:
+            try:
+                await self._device.set_power(False)
+            except TimeoutError:
+                _LOGGER.warning("LIFX %s: Power off timed out", self.name)
+            except (LifxError, OSError) as e:
+                _LOGGER.warning("LIFX %s: Power off error: %s", self.name, e)
+            try:
+                await self._device.close()
+            except (LifxError, OSError) as e:
+                _LOGGER.warning("LIFX %s: Close error: %s", self.name, e)
+            self._device = None
+            self._connected = False
+
+    def activate(self):
+        if self._destination is None:
+            super().activate()
+            return
+
+        super().activate()
+        _LOGGER.debug(
+            "LIFX %s: Activating with config refresh_rate=%s, max_refresh_rate=%s",
+            self.name,
+            self.config.refresh_rate,
+            self.max_refresh_rate,
+        )
+
+        # Use Animator for matrix/strip (high performance)
+        # Keep connection-based for single bulbs
+        if self._lifx_type in ("matrix", "strip", "mirror"):
+            async_fire_and_forget(
+                self._create_animator(),
+                loop=self._ledfx.loop,
+            )
+        else:
+            async_fire_and_forget(
+                self._async_connect(),
+                loop=self._ledfx.loop,
+            )
+
+    def deactivate(self):
+        if self._animator:
+            self._animator.close()
+            self._animator = None
+        if self._device:
+            async_fire_and_forget(
+                self._async_disconnect(),
+                loop=self._ledfx.loop,
+            )
+        super().deactivate()
+
+    async def _async_flush(self, data):
+        """Send pixel data to single bulb device."""
+        if not self._device or not self._connected:
+            return
+        await self._flush_light(data)
+
+    @property
+    def effective_refresh_rate(self):
+        """Get refresh rate capped by device type."""
+        # Use virtual's rate if available, otherwise device's configured rate
+        if self.priority_virtual:
+            rate = self.priority_virtual.refresh_rate
+        else:
+            rate = self.max_refresh_rate
+
+        # Only cap single bulbs to prevent strobing
+        if self._lifx_type == "light":
+            return min(rate, MAX_FPS_LIGHT)
+        return rate
+
+    @property
+    def frame_duration_ms(self):
+        """Frame duration in milliseconds for hardware interpolation.
+
+        Subtract 2ms buffer so interpolation completes before next frame arrives.
+        """
+        return max(1, int(1000 / self.effective_refresh_rate) - 2)
+
+    async def _flush_light(self, data):
+        """Send color to single bulb - fire and forget, no ack."""
+        if not isinstance(self._device, Light):
+            return
+
+        try:
+            pixels = data.astype(np.dtype("B")).reshape(-1, 3)
+            if len(pixels) > 0:
+                r, g, b = pixels[0]
+                color = HSBK.from_rgb(r / 255.0, g / 255.0, b / 255.0).to_protocol()
+                packet = packets.Light.SetColor(
+                    color=color, duration=self.frame_duration_ms
+                )
+                await self._device.connection.send_packet(packet)
+        except (LifxError, OSError) as e:
+            _LOGGER.warning("LIFX %s: Light flush error: %s", self.config.name, e)
+
+    def flush(self, data):
+        if self._animator:
+            # Animation module (synchronous, high performance)
+            try:
+                pixels = data.astype(np.dtype("B")).reshape(-1, 3)
+                if self._mirror_positions is not None:
+                    # Scatter zone-ordered pixels into the Mirror's buffer;
+                    # unused buffer positions stay black
+                    positions = self._mirror_positions[: len(pixels)]
+                    canvas = np.zeros((self._animator.pixel_count, 3), dtype=np.uint8)
+                    canvas[positions] = pixels[: len(positions)]
+                    pixels = canvas
+                pixel_count = min(len(pixels), self._animator.pixel_count)
+                hsbk_data = numpy_rgb_to_hsbk(pixels[:pixel_count])
+
+                # Pad if needed
+                while len(hsbk_data) < self._animator.pixel_count:
+                    hsbk_data.append((0, 0, 0, 3500))
+
+                self._animator.send_frame(hsbk_data)
+            except (LifxError, LifxTimeoutError, OSError, ValueError) as e:
+                _LOGGER.warning(
+                    "LIFX %s: Frame send error: %s",
+                    self.name,
+                    e,
+                    exc_info=not isinstance(e, LifxTimeoutError),
+                )
+
+        elif self._device and self._connected:
+            # Fallback for single bulbs or Animator failure
+            async_fire_and_forget(
+                self._async_flush(data),
+                loop=self._ledfx.loop,
+            )

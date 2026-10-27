@@ -1,0 +1,23 @@
+import ledfx_assets
+
+PROJECT_VERSION = "2.2.0"  # x-release-please-version
+PROJECT_NAME = "LedFx"
+PROJECT_AUTHOR = "LedFx Developers"
+PROJECT_LICENSE = "GPL-3.0"
+CONFIG_MAJOR_VERSION = 2
+CONFIG_MINOR_VERSION = 3
+CONFIG_MICRO_VERSION = 6
+
+# Dev turns sentry logging on and off
+DEV = 0
+
+CONFIGURATION_VERSION = (
+    f"{CONFIG_MAJOR_VERSION}.{CONFIG_MINOR_VERSION}.{CONFIG_MICRO_VERSION}"
+)
+# Written to every config.json forever: pre-overhaul LedFx builds re-run their
+# destructive migrate_config() on files that lack it (see ConfigStore).
+LEGACY_CONFIGURATION_VERSION = "2.3.6"
+LEDFX_ASSETS_PATH = ledfx_assets.where()
+
+if __name__ == "__main__":
+    print(PROJECT_VERSION)

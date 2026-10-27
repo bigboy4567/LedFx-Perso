@@ -1,0 +1,440 @@
+import logging
+import random
+from collections import deque
+from enum import Enum
+from typing import Annotated, ClassVar
+
+import numpy as np
+from PIL import Image
+from pydantic import Field
+
+from ledfx.configuration.fields import CoercedFloat, CoercedInt, OneOf
+from ledfx.configuration.plugin import TypedConfig
+from ledfx.effects.audio import AudioReactiveEffect
+from ledfx.effects.twod import Twod
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class HealthOptions(Enum):
+    ALL = "All"
+    DEAD = "Dead"
+    OSCILLATING = "Oscillating"
+    NONE = "None"
+
+
+class GameOfLifeVisualiser(Twod):
+    NAME = "Game of Life"
+    CATEGORY = "Matrix"
+    # life stages are hard coded colors, dont allow pre fill background
+    HIDDEN_KEYS = Twod.HIDDEN_KEYS + [
+        "gradient",
+        "gradient_roll",
+        "background_mode",
+    ]
+    ADVANCED_KEYS = Twod.ADVANCED_KEYS + [
+        "health_check_interval",
+        "frequency_range",
+        "impulse_decay",
+    ]
+    HEALTH_CHECK_OPTIONS_VALUES: ClassVar[dict[str, dict[str, bool]]] = {
+        HealthOptions.ALL.value: {
+            HealthOptions.DEAD.value: True,
+            HealthOptions.OSCILLATING.value: True,
+        },
+        HealthOptions.DEAD.value: {
+            HealthOptions.DEAD.value: True,
+            HealthOptions.OSCILLATING.value: False,
+        },
+        HealthOptions.OSCILLATING.value: {
+            HealthOptions.DEAD.value: False,
+            HealthOptions.OSCILLATING.value: True,
+        },
+        HealthOptions.NONE.value: {
+            HealthOptions.DEAD.value: False,
+            HealthOptions.OSCILLATING.value: False,
+        },
+    }
+
+    history = 5
+    # need history plus one colors
+
+    dead_colors = np.array(
+        [
+            [180, 0, 0],
+            [120, 0, 0],
+            [60, 0, 0],
+            [30, 0, 0],
+            [15, 0, 0],
+            [0, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+
+    live_colors = np.array(
+        [
+            [0, 180, 0],
+            [0, 255, 0],
+            [255, 255, 255],
+            [200, 200, 200],
+            [150, 150, 150],
+            [100, 100, 100],
+        ],
+        dtype=np.uint8,
+    )
+
+    class Config(Twod.Config):
+        health_checks: Annotated[
+            str, OneOf([option.value for option in HealthOptions])
+        ] = Field(
+            HealthOptions.ALL.value,
+            description="Check for and correct common unhealthy states",
+        )
+        base_game_speed: CoercedInt = Field(
+            30, description="Base number of steps per second to run", ge=1, le=60
+        )
+        health_check_interval: CoercedInt = Field(
+            5, description="Number of seconds between health checks", ge=1, le=30
+        )
+        frequency_range: Annotated[
+            str, OneOf(list(AudioReactiveEffect.POWER_FUNCS_MAPPING.keys()))
+        ] = Field(
+            "Lows (beat+bass)",
+            description="Frequency range for life generation impulse",
+        )
+        beat_inject: bool = Field(True, description="Generate entities on beat")
+        impulse_decay: CoercedFloat = Field(
+            0.05,
+            description="Decay filter applied to the life generation impulse",
+            ge=0.01,
+            le=0.1,
+        )
+
+    config = TypedConfig(Config)
+
+    def __init__(self, ledfx, config):
+        super().__init__(ledfx, config)
+        self.onset = None
+        self.last_health_check = self.now
+        self.last_game_step = self.now
+        self.game = None
+
+    def config_updated(self, config):
+        super().config_updated(config)
+        self.inject = self.config.beat_inject
+        self.health_check_options = self.HEALTH_CHECK_OPTIONS_VALUES[
+            self.config.health_checks
+        ]
+        self.base_game_speed = self.config.base_game_speed
+        self.health_check_interval = self.config.health_check_interval
+        if any(self.health_check_options.values()):
+            self.check_health = True
+        else:
+            self.check_health = False
+        self.power_func = self.POWER_FUNCS_MAPPING[self.config.frequency_range]
+        self.decay = self.config.impulse_decay
+        self.impulse_filter = self.create_filter(
+            alpha_decay=self.decay, alpha_rise=0.99
+        )
+        self.impulse = 0.0
+
+    def do_once(self):
+        super().do_once()
+        self.game = GameOfLife(
+            height=self.r_height, width=self.r_width, depth=self.history
+        )
+        if self.r_height <= 4 or self.r_width <= 4:
+            _LOGGER.info(
+                "Board too small at %s disabling beat injection of entities",
+                self.game.board_size,
+            )
+            self.inject = False
+
+        # Pre-allocate image array to reuse across frames (avoid creating new arrays each frame)
+        self.img_array = np.zeros((self.r_height, self.r_width, 3), dtype=np.uint8)
+        # Pre-allocate history stack array to avoid creating new arrays every frame
+        self.game._history_stack = np.zeros(
+            (self.history, self.r_height, self.r_width), dtype=bool
+        )
+
+    def deactivate(self):
+        """Clean up resources when effect is deactivated"""
+        if self.game:
+            self.game.board = None
+            self.game.board_history = None
+            self.game._history_buffer = None
+            self.game._history_stack = None
+            self.game = None
+        self.img_array = None
+        super().deactivate()
+
+    def audio_data_updated(self, data):
+        if self.inject and data.volume_beat_now() and self.game:
+            self.game.add_random_entity()
+
+        # if decay is set to minimum, then just run generations at full rate
+        if self.decay == 0.01:
+            self.impulse = 1.0
+        else:
+            self.impulse = self.impulse_filter.update(getattr(data, self.power_func)())
+
+    def draw(self):
+        if self.test:
+            self.draw_test(self.m_draw)
+
+        self.check_board_health(self.now)
+        self.step_board_if_time_elapsed(self.now)
+        self.update_image_with_board()
+
+    def check_board_health(self, current_time):
+        """
+        Checks the health of the game board and performs necessary actions based on the health check options.
+
+        Args:
+            current_time (float): The current time in seconds.
+
+        Returns:
+            None
+        """
+        if (
+            self.check_health
+            and current_time - self.last_health_check >= self.health_check_interval
+        ):
+            if self.health_check_options[HealthOptions.DEAD.value]:
+                self.game.check_board_life()
+            if self.health_check_options[HealthOptions.OSCILLATING.value]:
+                self.game.check_board_oscillating()
+
+            self.last_health_check = current_time
+
+    def step_board_if_time_elapsed(self, current_time):
+        """
+        Steps the game board if the specified time has elapsed since the last step.
+
+        Args:
+            current_time (float): The current time in seconds.
+
+        Returns:
+            None
+        """
+        if (
+            self.impulse > 0
+            and current_time - self.last_game_step
+            >= 1 / self.impulse / self.base_game_speed
+        ):
+            self.game.step_board()
+            self.last_game_step = current_time
+
+    def update_image_with_board(self):
+        """
+        Updates the image with the current game board using vectorization for improved performance.
+        """
+
+        # Use game board and history directly
+        current_board = self.game.board
+        # Update pre-allocated history stack in-place to avoid creating new arrays
+        for i, board in enumerate(self.game.board_history):
+            np.copyto(self.game._history_stack[i], board)
+        history_stack = self.game._history_stack
+
+        # Calculate alive and dead durations using vectorization
+        alive_durations = np.sum(history_stack, axis=0)
+        dead_durations = np.sum(~history_stack, axis=0)
+
+        # Map durations to colors using vectorized operations
+        for duration in range(len(self.live_colors)):
+            alive_mask = np.logical_and(current_board, alive_durations == duration)
+            self.img_array[alive_mask] = self.live_colors[duration]
+
+        for duration in range(len(self.dead_colors)):
+            # where pixel is long dead, don't draw black, allows any image
+            # behind to show through, and well as faster for all non plots
+            if duration == 5:
+                continue
+
+            dead_mask = np.logical_and(~current_board, dead_durations == duration)
+            self.img_array[dead_mask] = self.dead_colors[duration]
+
+        # Clear old PIL Image reference before creating new one to help GC
+        if hasattr(self, "matrix") and self.matrix is not None:
+            old_matrix = self.matrix
+            self.matrix = None
+            del old_matrix
+
+        # Convert the reused NumPy array to PIL Image
+        self.matrix = Image.fromarray(self.img_array)
+
+
+class GameOfLife:
+    """
+    Represents the Game of Life simulation.
+
+    Attributes:
+        board_history (list): A list to store the history of the game boards.
+        board_size (array): the board height and width
+        board (np array): the matrix that stores cell values
+        last_history_clear (time): the time of the last history clear
+
+    Methods:
+        initialize_board(): Initializes the game board with random cell states.
+        step_board(board): Performs one step of the game simulation.
+        board_is_dead(): Checks if the game board has reached a dead state.
+        board_is_oscillating(lookback_generations): Checks if the game board is oscillating.
+        update_image_with_board(image, board): Updates the image with the current game board.
+        cleanup_board_history(): Clears the history of the game boards.
+        add_glider(board): Generates a glider somewhere on the board.
+        add_blinker(board): Generates a blinker somewhere on the board.
+        add_toad(board): Generates a toad somewhere on the board.
+        add_beacon(board): Generates a beacon somewhere on the board.
+        add_random_entity(board): Generates a random entity on the board.
+    """
+
+    def __init__(self, height, width, depth):
+        self.depth = depth
+        self.board_size = [height, width]
+        self.board = self.random_board()
+        # Use deque with maxlen for efficient fixed-size history (no pop(0) needed)
+        self.board_history = deque(maxlen=depth)
+        # Pre-allocate reusable array to avoid np.copy() every frame
+        self._history_buffer = np.zeros(self.board_size, dtype=bool)
+        self.empty_board_history()
+        _LOGGER.info("Universe invented 🌌")
+
+    def random_board(self):
+        """
+        Return a board with random cell states.
+
+        Returns:
+            numpy.ndarray: The random game board.
+        """
+        _LOGGER.info("Evolving life")
+        return np.random.choice([True, False], size=self.board_size)
+
+    def step_board(self):
+        """
+        Performs one step of the game simulation.
+        """
+        # Update board_history using pre-allocated buffer to avoid np.copy()
+        # Copy current board state into buffer, then append a COPY to history
+        np.copyto(self._history_buffer, self.board)
+        self.board_history.append(self._history_buffer.copy())
+        # Reuse _history_buffer for next frame (no new allocation needed)
+
+        neighbors = sum(
+            np.roll(np.roll(self.board, i, 0), j, 1)
+            for i in (-1, 0, 1)
+            for j in (-1, 0, 1)
+            if (i != 0 or j != 0)
+        )
+        self.board = (neighbors == 3) | (self.board & (neighbors == 2))
+        return self.board
+
+    def check_board_life(self):
+        """
+        Checks if the game board has reached a dead state.
+
+        Returns:
+            bool: True if the game board is dead, False otherwise.
+        """
+        if len(self.board_history) < 2:
+            return False
+        current_board = self.board_history[-2]
+        previous_board = self.board_history[-1]
+        if np.array_equal(current_board, previous_board):
+            _LOGGER.info("Board has died")
+            self.empty_board_history()
+            self.board = self.random_board()
+            return True
+        return False
+
+    def check_board_oscillating(self, lookback_generations=5):
+        """
+        Checks if the game board is oscillating.
+
+        Args:
+            lookback_generations (int): The number of previous generations to look back.
+
+        Returns:
+            bool: True if the game board is oscillating, False otherwise.
+        """
+        if len(self.board_history) < lookback_generations:
+            return False
+        # Convert deque to list for slicing (deque doesn't support negative slicing)
+        history_list = list(self.board_history)
+        lookback_boards = history_list[-lookback_generations:]
+        last_board = lookback_boards[-1]
+        for i in range(len(lookback_boards) - 1):  # Exclude the last board
+            if np.array_equal(lookback_boards[i], last_board):
+                _LOGGER.info("Board is oscillating")
+                self.empty_board_history()
+                self.board = self.random_board()
+                return True
+        return False
+
+    def empty_board_history(self):
+        """
+        Clears the board history.
+        """
+        _LOGGER.info("Erasing history of the universe")
+        self.board_history.clear()
+        # Reuse template zero array to reduce allocations
+        zero_board = np.zeros(self.board_size, dtype=bool)
+        for _ in range(self.depth):
+            self.board_history.append(zero_board.copy())
+
+    def add_glider(self):
+        """
+        Generates a glider somewhere on the board
+        """
+        glider = np.array([[0, 0, 1], [1, 0, 1], [0, 1, 1]])
+        rows, cols = self.board_size
+        start_row = np.random.randint(0, rows - 3)
+        start_col = np.random.randint(0, cols - 3)
+        self.board[start_row : start_row + 3, start_col : start_col + 3] = glider
+        _LOGGER.debug("Added glider at: %sx%s", start_row, start_col)
+
+    def add_blinker(self):
+        """
+        Generates a blinker somewhere on the board
+        """
+        blinker = np.array([[1, 1, 1]])
+        rows, cols = self.board_size
+        start_row = np.random.randint(0, rows - 1)
+        start_col = np.random.randint(0, cols - 3)
+        self.board[start_row, start_col : start_col + 3] = blinker
+        _LOGGER.debug("Added blinker at: %sx%s", start_row, start_col)
+
+    def add_toad(self):
+        """
+        Generates a toad somewhere on the board
+        """
+        toad = np.array([[0, 1, 1, 1], [1, 1, 1, 0]])
+        rows, cols = self.board_size
+        start_row = np.random.randint(0, rows - 2)
+        start_col = np.random.randint(0, cols - 4)
+        self.board[start_row : start_row + 2, start_col : start_col + 4] = toad
+        _LOGGER.debug("Added toad at: %sx%s", start_row, start_col)
+
+    def add_beacon(self):
+        """
+        Generates a beacon somewhere on the board
+        """
+        beacon = np.array([[1, 1, 0, 0], [1, 1, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1]])
+        rows, cols = self.board_size
+        start_row = np.random.randint(0, rows - 4)
+        start_col = np.random.randint(0, cols - 4)
+        self.board[start_row : start_row + 4, start_col : start_col + 4] = beacon
+        _LOGGER.debug("Added beacon at: %sx%s", start_row, start_col)
+
+    def add_random_entity(self):
+        """
+        Generates a random entity on the board
+        """
+        entities = [
+            self.add_glider,
+            self.add_blinker,
+            self.add_toad,
+            self.add_beacon,
+        ]
+        random_entity = random.choice(entities)
+        random_entity()
