@@ -36,6 +36,7 @@ from ledfx.effects.utils.custom import (
     BeatLatch,
     BoolArray,
     FloatArray,
+    HitClassifier,
     IntArray,
     PeakTracker,
     TempoTracker,
@@ -367,3 +368,21 @@ def aurora_colors(shade: FloatArray) -> FloatArray:
 def breath(phase: ArrayLike) -> FloatArray:
     """How full a breath is at this point of it, 0 empty to 1 full, one breath per unit."""
     return 0.5 - 0.5 * np.cos(2 * np.pi * np.asarray(phase, dtype=float))
+
+
+class DrumLatch:
+    """Holds the drums heard on the audio thread (KICK, SNARE, HAT) until a frame takes them."""
+
+    def __init__(self) -> None:
+        self._classifier = HitClassifier()
+        self._pending: set[int] = set()
+
+    def listen(self, data: AudioAnalysisSource) -> None:
+        drum = self._classifier.listen(data)
+        if drum is not None:
+            self._pending.add(drum)
+
+    def take(self) -> set[int]:
+        """The drums hit since the last call."""
+        drums, self._pending = self._pending, set()
+        return drums

@@ -16,11 +16,7 @@ from ledfx.effects.arpeggiator import Arpeggiator
 from ledfx.effects.audio import AudioAnalysisSource, AudioReactiveEffect
 from ledfx.effects.aurora import Aurora
 from ledfx.effects.beat_counter import BeatCounter
-from ledfx.effects.bitcrush import Bitcrush
 from ledfx.effects.blacklight import Blacklight
-from ledfx.effects.blinders import Blinders
-from ledfx.effects.candles import Candles
-from ledfx.effects.charge_up import ChargeUp
 from ledfx.effects.chopper import Chopper
 from ledfx.effects.chorus import Chorus
 from ledfx.effects.color_jump import ColorJump
@@ -28,15 +24,11 @@ from ledfx.effects.color_organ import ColorOrgan
 from ledfx.effects.confetti import Confetti
 from ledfx.effects.dance_floor import DanceFloor
 from ledfx.effects.dither import Dither
-from ledfx.effects.doppler import Doppler
 from ledfx.effects.drum_pads import DrumPads
 from ledfx.effects.eclipse import Eclipse
 from ledfx.effects.fiber_optic import FiberOptic
-from ledfx.effects.filter_sweep import FilterSweep
 from ledfx.effects.fireflies import Fireflies
-from ledfx.effects.flame_jets import FlameJets
 from ledfx.effects.freeze import Freeze
-from ledfx.effects.god_rays import GodRays
 from ledfx.effects.heartbeat import Heartbeat
 from ledfx.effects.interference import Interference
 from ledfx.effects.jacobs_ladder import JacobsLadder
@@ -45,23 +37,17 @@ from ledfx.effects.lens_flare import LensFlare
 from ledfx.effects.lighthouse import Lighthouse
 from ledfx.effects.lightning import Lightning
 from ledfx.effects.magma import Magma
-from ledfx.effects.neon_sign import NeonSign
-from ledfx.effects.oil_slick import OilSlick
 from ledfx.effects.overdrive import Overdrive
 from ledfx.effects.palette_cycle import PaletteCycle
 from ledfx.effects.palette_morph import PaletteMorph
-from ledfx.effects.phaser import Phaser
 from ledfx.effects.phone_paint import PhonePaint
 from ledfx.effects.piano_keys import PianoKeys
 from ledfx.effects.police_lights import PoliceLights
 from ledfx.effects.polyrhythm import Polyrhythm
-from ledfx.effects.rgb_split import RgbSplit
-from ledfx.effects.riser import Riser
 from ledfx.effects.sandstorm import Sandstorm
 from ledfx.effects.section_strobe import SectionStrobe
 from ledfx.effects.sidechain_pump import SidechainPump
 from ledfx.effects.sound_locator import SoundLocator
-from ledfx.effects.stage_wash import StageWash
 from ledfx.effects.stutter import Stutter
 from ledfx.effects.swell import Swell
 from ledfx.effects.synthwave_sun import SynthwaveSun
@@ -77,7 +63,6 @@ from ledfx.effects.utils.custom import (
     note_color,
     segment_widths,
 )
-from ledfx.effects.vibrating_string import VibratingString
 from ledfx.effects.vinyl_scratch import VinylScratch
 from ledfx.effects.wagon_wheel import WagonWheel
 from ledfx.effects.wobble import Wobble
@@ -92,16 +77,12 @@ CUSTOM_EFFECTS: list[type[AudioReactiveEffect]] = [
     Kaleidoscope,
     ColorJump,
     Interference,
-    ChargeUp,
     PianoKeys,
     DrumPads,
     SoundLocator,
     Lightning,
     Aurora,
-    Candles,
     BeatCounter,
-    NeonSign,
-    VibratingString,
     ColorOrgan,
     Polyrhythm,
     SidechainPump,
@@ -109,26 +90,17 @@ CUSTOM_EFFECTS: list[type[AudioReactiveEffect]] = [
     Arpeggiator,
     Wobble,
     TapeStop,
-    Phaser,
-    Bitcrush,
     VinylScratch,
-    Riser,
     Stutter,
     Swell,
-    FilterSweep,
-    Blinders,
-    StageWash,
-    FlameJets,
     Blacklight,
     DanceFloor,
     LensFlare,
     Lighthouse,
-    Doppler,
     JacobsLadder,
     Magma,
     Freeze,
     Eclipse,
-    RgbSplit,
     PaletteCycle,
     Accordion,
     PaletteMorph,
@@ -140,8 +112,6 @@ CUSTOM_EFFECTS: list[type[AudioReactiveEffect]] = [
     Chorus,
     Overdrive,
     FiberOptic,
-    GodRays,
-    OilSlick,
     Sandstorm,
     WagonWheel,
     Chopper,
@@ -397,16 +367,6 @@ def test_interference_colors_follow_their_bands() -> None:
     assert treble[:, 1].sum() > treble[:, 0].sum()
 
 
-def test_charge_up_builds_and_bursts() -> None:
-    effect = make(ChargeUp, 100, charge_per_beat=0.3, leak=0.0)
-    run(effect, 0.5, FakeAudio(beat=True, lows=0.5))
-    assert effect._charge == pytest.approx(0.3)
-    for _ in range(3):
-        run(effect, 0.5, FakeAudio(beat=True, lows=0.5))
-    assert effect._charge == 0.0
-    assert effect._boom > 0
-
-
 def test_note_color_wheel() -> None:
     np.testing.assert_allclose(note_color(60), (255, 0, 0))
     np.testing.assert_allclose(note_color(72), note_color(60))
@@ -493,15 +453,6 @@ def test_aurora_glows_brighter_with_the_mids() -> None:
     assert loud > quiet * 2
 
 
-def test_candles_burn_in_separate_flames() -> None:
-    red = run(make(Candles, 60, candles=3, beat_flare=False), 1)[:, 0]
-    for candle in range(3):
-        flame = red[candle * 20 : (candle + 1) * 20]
-        # Brightest in the middle of its own space, dark at the edges
-        assert 7 <= flame.argmax() <= 12
-        assert flame[0] < flame.max() * 0.3
-
-
 def test_beat_counter_counts_in_binary_and_gray_code() -> None:
     for code, expected in (("Binary", [1, 0, 1, 0]), ("Gray", [1, 1, 1, 0])):
         effect = make(BeatCounter, 40, bits=4, code=code, gap=False)
@@ -514,25 +465,6 @@ def test_beat_counter_counts_in_binary_and_gray_code() -> None:
 
 def tube_peaks(pixels: NDArray[np.float64], tubes: int) -> NDArray[np.float64]:
     return pixels.reshape(tubes, -1, 3).max(axis=(1, 2))
-
-
-def test_neon_sign_tube_stutters_back_on_after_a_beat() -> None:
-    effect = make(NeonSign, 50, tubes=5, faulty=0.0)
-    steady = tube_peaks(frame(effect, FakeAudio()), 5)
-    struck = tube_peaks(frame(effect, FakeAudio(beat=True)), 5)
-    assert np.count_nonzero(struck < steady * 0.2) == 1
-    assert (tube_peaks(run(effect, 0.5), 5) > steady * 0.8).all()
-
-
-def test_vibrating_string_rings_after_a_pluck() -> None:
-    effect = make(VibratingString, 101, pluck="Center")
-    assert run(effect, 0.5).max() <= 255 * 0.05
-    frame(effect, FakeAudio(beat=True))
-    # Plucked in the middle, a string rings in its odd harmonics only
-    assert np.abs(effect._amplitudes[1::2]).max() < 1e-9
-    assert effect._amplitudes[0] > 0
-    assert run(effect, 0.1).max() > 100
-    assert run(effect, 5).max() <= 255 * 0.05
 
 
 def test_color_organ_lights_each_band_on_its_own_lamps() -> None:
@@ -607,19 +539,6 @@ def test_tape_stop_winds_down_in_a_break_and_back_up() -> None:
     assert effect._speed == 1.0
 
 
-def test_phaser_cuts_dark_notches() -> None:
-    notched = frame(make(Phaser, 200, depth=1.0, resonance=0.0), FakeAudio())
-    plain = frame(make(Phaser, 200, depth=0.0), FakeAudio())
-    assert np.count_nonzero(notched.max(axis=1) < 20) > 10
-    assert np.count_nonzero(plain.max(axis=1) < 20) == 0
-
-
-def test_bitcrush_cuts_the_picture_into_blocks_and_few_colors() -> None:
-    crushed = run(make(Bitcrush, 150, crush=1.0), 0.2, FakeAudio(highs=1.0))
-    smooth = run(make(Bitcrush, 150, crush=0.0), 0.2, FakeAudio(highs=0.0))
-    assert len(np.unique(crushed, axis=0)) * 3 < len(np.unique(smooth, axis=0))
-
-
 def test_vinyl_scratch_drags_the_record_back_and_forth() -> None:
     effect = make(VinylScratch, 100)
     frame(effect, FakeAudio(beat=True))
@@ -631,19 +550,6 @@ def test_vinyl_scratch_drags_the_record_back_and_forth() -> None:
     assert max(pulls) > 1
     run(effect, 1)
     assert effect.pull() == 0
-
-
-def test_riser_builds_with_a_rising_song_and_drops() -> None:
-    effect = make(Riser, 100)
-    run(effect, 30, FakeAudio(lows=0.1, mids=0.1, highs=0.1))
-    assert effect.build < 0.2
-    for step in range(30):
-        level = 0.1 + 0.03 * step
-        run(effect, 0.1, FakeAudio(lows=level, mids=level, highs=level))
-    assert effect.build > 0.6
-    frame(effect, FakeAudio(beat=True, lows=1.0, mids=1.0, highs=1.0))
-    assert effect.build == 0
-    assert effect._drop < 0.1
 
 
 def test_stutter_repeats_a_slice_along_the_strip() -> None:
@@ -662,44 +568,6 @@ def test_swell_builds_toward_the_next_beat() -> None:
         effect._tempo.beats = 3 + into
         sums.append(frame(effect).sum())
     assert sums[0] < sums[1] < sums[2]
-
-
-def test_filter_sweep_opens_with_bright_music() -> None:
-    def lit(lows: float, highs: float) -> int:
-        effect = make(FilterSweep, 100)
-        # Each band is measured against its own recent peak: set all three first
-        run(effect, 1, FakeAudio(lows=1.0, mids=1.0, highs=1.0))
-        return lit_pixels(
-            run(effect, 2, FakeAudio(lows=lows, mids=0.3, highs=highs)), above=30
-        )
-
-    assert lit(lows=0.1, highs=1.0) > lit(lows=1.0, highs=0.1) + 20
-
-
-def test_blinders_fire_on_a_heavy_beat_and_cool_down() -> None:
-    effect = make(Blinders, 80, blinders=4, pattern="All")
-    assert (tube_peaks(frame(effect, FakeAudio(beat=True, lows=1.0)), 4) > 200).all()
-    assert run(effect, 1.5).max() < 60
-    alternate = make(Blinders, 80, blinders=4, pattern="Alternate")
-    peaks = tube_peaks(frame(alternate, FakeAudio(beat=True, lows=1.0)), 4)
-    assert peaks[0] > 200
-    assert peaks[1] == 0
-
-
-def test_stage_wash_moves_to_a_new_look_each_phrase() -> None:
-    effect = make(StageWash, 80, bars=1, fade=0.1, bump=0.0)
-    first = run(effect, 0.5).copy()
-    effect._tempo.beats = 4.5
-    assert not np.allclose(run(effect, 0.5), first)
-
-
-def test_flame_jets_blast_on_the_beat_and_die_down() -> None:
-    effect = make(FlameJets, 100, jets=4, size=0.1)
-    assert run(effect, 0.3).max() == 0
-    pixels = run(effect, 0.2, FakeAudio(beat=True))
-    assert all(pixels[jet].max() > 150 for jet in (12, 37, 62, 87))
-    assert pixels[25].max() < 30
-    assert run(effect, 1.5).max() == 0
 
 
 def test_blacklight_glows_violet_with_neon_spots() -> None:
@@ -736,16 +604,6 @@ def test_lighthouse_beam_sweeps_and_blazes_when_facing() -> None:
     assert pixels[60:].sum() > pixels[:40].sum() * 5
     effect._turns = 0.25
     assert frame(effect, FakeAudio()).min() > 150
-
-
-def test_doppler_waves_crowd_blue_ahead_and_stretch_red_behind() -> None:
-    effect = make(Doppler, 200, speed=0.6)
-    effect.source, effect.heading = 0.2, 1.0
-    pixels = run(effect, 0.5)
-    at = int(effect.source * 199)
-    ahead, behind = pixels[at + 12 : at + 70], pixels[at - 70 : at - 12]
-    assert ahead[:, 2].sum() > ahead[:, 0].sum()
-    assert behind[:, 0].sum() > behind[:, 2].sum()
 
 
 def test_jacobs_ladder_arc_climbs_and_pops() -> None:
@@ -786,14 +644,6 @@ def test_eclipse_hides_the_sun_and_shows_the_corona() -> None:
     total = frame(effect, FakeAudio())
     assert total[50].max() < 20
     assert total[30].max() > clear[30].max()
-
-
-def test_rgb_split_pulls_red_and_blue_apart_on_the_beat() -> None:
-    effect = make(RgbSplit, 120, jitter=0.0, speed=0.0)
-    calm = frame(effect, FakeAudio())
-    assert (calm[:, 0] == calm[:, 2]).all()
-    split = frame(effect, FakeAudio(beat=True))
-    assert not np.allclose(split[:, 0], split[:, 2])
 
 
 def test_palette_cycle_turns_the_colors_with_the_song() -> None:
@@ -891,19 +741,6 @@ def test_fiber_optic_tips_take_the_colors_of_the_turning_wheel() -> None:
     before = effect.colors().copy()
     run(effect, 1)
     assert not np.allclose(effect.colors(), before)
-
-
-def test_god_rays_shine_from_the_sun_and_peek_on_the_beat() -> None:
-    effect = make(GodRays, 100)
-    calm = run(effect, 0.5).copy()
-    assert calm[:10].sum() > calm[-10:].sum() * 3
-    assert frame(effect, FakeAudio(beat=True)).sum() > calm.sum()
-
-
-def test_oil_slick_shows_iridescent_colors() -> None:
-    pixels = frame(make(OilSlick, 200), FakeAudio())
-    spread = pixels.max(axis=1) - pixels.min(axis=1)
-    assert (spread > 100).mean() > 0.3
 
 
 def test_sandstorm_gusts_with_the_bass() -> None:

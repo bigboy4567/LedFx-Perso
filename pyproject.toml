@@ -144,6 +144,10 @@ constraint-dependencies = [
     "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 
+[tool.ruff]
+# The LedFx to iCUE bridge is a copy of its own project, kept in its own style.
+extend-exclude = ["icue_bridge"]
+
 [tool.ruff.lint]
 # ruff's defaults, plus: no f-strings in logging calls (format lazily).
 # Pre-existing violations are baselined with `# noqa`; fix them as you go.

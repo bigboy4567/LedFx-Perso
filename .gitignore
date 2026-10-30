@@ -91,3 +91,5 @@ docs/superpowers/
 /dev_config/
 .ruff_cache/
 .pdm-build/
+# The iCUE bridge writes its settings through this temporary file
+icue_bridge/config.json.tmp

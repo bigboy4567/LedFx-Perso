@@ -46,7 +46,8 @@ def test_committed_spec_is_current() -> None:
 # Raised to 2.2 MB with the 63 local Custom effects (1.91 MB measured): each
 # effect type adds its own config and state components, 12 to 14 KB apiece.
 # Raised to 2.8 MB with the 62 Corsair effects (2.64 MB measured), then to 3.7 MB
-# with 75 more (3.48 MB measured).
+# with 75 more (3.48 MB measured), then to 5 MB with 100 more (4.58 MB measured),
+# and back to 3.7 MB once 88 of them were removed (3.40 MB measured).
 SPEC_BUDGET_BYTES = 3_700_000
 
 

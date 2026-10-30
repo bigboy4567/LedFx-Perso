@@ -17,6 +17,22 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
+rem Passerelle iCUE (icue_bridge\) : envoie les effets aux peripheriques Corsair.
+rem Elle demarre dans sa propre fenetre, sauf si elle tourne deja (port du clavier pris).
+rem START_BRIDGE=0 pour lancer LedFx seul ; BRIDGE_MODE : unique, group ou fusion.
+set "START_BRIDGE=1"
+set "BRIDGE_MODE=unique"
+set "BRIDGE_PORT=6477"
+if "%START_BRIDGE%"=="1" (
+    netstat -ano -p UDP | findstr /C:":%BRIDGE_PORT% " >nul
+    if errorlevel 1 (
+        echo Lancement de la passerelle iCUE ^(mode %BRIDGE_MODE%^)...
+        start "LedFx iCUE Bridge" /min cmd /c ""%~dp0icue_bridge\lancer_bridge.bat" --mode %BRIDGE_MODE%"
+    ) else (
+        echo La passerelle iCUE tourne deja.
+    )
+)
+
 rem Deja lance (double-clic de trop) : on ouvre juste l'interface au lieu d'un 2e LedFx
 netstat -ano | findstr /R /C:":%PORT% .*LISTENING" >nul
 if not errorlevel 1 (

@@ -1,6 +1,7 @@
 """The Corsair effects: the real layouts of the gear, and each effect doing what it says."""
 
 import typing
+from collections.abc import Callable
 
 import numpy as np
 import pytest
@@ -9,23 +10,41 @@ from numpy.typing import NDArray
 from ledfx.effects import Effect
 from ledfx.effects.audio import AudioReactiveEffect
 from ledfx.effects.fan_aurora import FanAurora
+from ledfx.effects.fan_bar_counter import FanBarCounter
+from ledfx.effects.fan_battery import FanBattery
 from ledfx.effects.fan_bounce import FanBounce
 from ledfx.effects.fan_breathe import FanBreathe
 from ledfx.effects.fan_butterfly import FanButterfly
 from ledfx.effects.fan_cascade import FanCascade
 from ledfx.effects.fan_chase import FanChase
+from ledfx.effects.fan_clock import FanClock
+from ledfx.effects.fan_color_wheel import FanColorWheel
+from ledfx.effects.fan_comets import FanComets
 from ledfx.effects.fan_dice import FanDice
+from ledfx.effects.fan_eyes import FanEyes
 from ledfx.effects.fan_fire import FanFire
+from ledfx.effects.fan_fireworks import FanFireworks
+from ledfx.effects.fan_gauges import FanGauges
+from ledfx.effects.fan_glitch import FanGlitch
+from ledfx.effects.fan_kaleidoscope import FanKaleidoscope
 from ledfx.effects.fan_lava import FanLava
 from ledfx.effects.fan_meter import FanMeter
 from ledfx.effects.fan_metronome import FanMetronome
+from ledfx.effects.fan_note_color import FanNoteColor
 from ledfx.effects.fan_pinwheel import FanPinwheel
 from ledfx.effects.fan_planets import FanPlanets
+from ledfx.effects.fan_plasma import FanPlasma
+from ledfx.effects.fan_pop import FanPop
 from ledfx.effects.fan_pulse import FanPulse
 from ledfx.effects.fan_rain import FanRain
+from ledfx.effects.fan_rainbow import FanRainbow
 from ledfx.effects.fan_relay import FanRelay
+from ledfx.effects.fan_ripple import FanRipple
+from ledfx.effects.fan_riser import FanRiser
 from ledfx.effects.fan_rotor import FanRotor
+from ledfx.effects.fan_scanner import FanScanner
 from ledfx.effects.fan_siren import FanSiren
+from ledfx.effects.fan_snake import FanSnake
 from ledfx.effects.fan_sparks import FanSparks
 from ledfx.effects.fan_spectrum import FanSpectrum
 from ledfx.effects.fan_stack import FanStack
@@ -34,48 +53,74 @@ from ledfx.effects.fan_storm import FanStorm
 from ledfx.effects.fan_strobe import FanStrobe
 from ledfx.effects.fan_timer import FanTimer
 from ledfx.effects.fan_traffic_light import FanTrafficLight
+from ledfx.effects.fan_turntables import FanTurntables
 from ledfx.effects.fan_vortex import FanVortex
+from ledfx.effects.fan_wave import FanWave
 from ledfx.effects.fan_yin_yang import FanYinYang
 from ledfx.effects.key_aurora import KeyAurora
+from ledfx.effects.key_bounce import KeyBounce
+from ledfx.effects.key_bouncing_logo import KeyBouncingLogo
 from ledfx.effects.key_breathe import KeyBreathe
-from ledfx.effects.key_checkerboard import KeyCheckerboard
-from ledfx.effects.key_comets import KeyComets
+from ledfx.effects.key_color_wheel import KeyColorWheel
+from ledfx.effects.key_drum_kit import KeyDrumKit
 from ledfx.effects.key_equalizer import KeyEqualizer
 from ledfx.effects.key_fire import KeyFire
+from ledfx.effects.key_fireflies import KeyFireflies
 from ledfx.effects.key_fireworks import KeyFireworks
-from ledfx.effects.key_ghost_typist import KeyGhostTypist
+from ledfx.effects.key_fountain import KeyFountain
+from ledfx.effects.key_glitch import KeyGlitch
+from ledfx.effects.key_kaleidoscope import KeyKaleidoscope
 from ledfx.effects.key_lava_lamp import KeyLavaLamp
+from ledfx.effects.key_level import KeyLevel
+from ledfx.effects.key_marquee import KeyMarquee, text_bitmap
+from ledfx.effects.key_meteors import KeyMeteors
+from ledfx.effects.key_notes import KeyNotes
+from ledfx.effects.key_ocean import KeyOcean
 from ledfx.effects.key_plasma import KeyPlasma
 from ledfx.effects.key_pong import KeyPong
 from ledfx.effects.key_radar import KeyRadar
+from ledfx.effects.key_radial_eq import KeyRadialEq
 from ledfx.effects.key_rain import KeyRain
 from ledfx.effects.key_rainbow import KeyRainbow
+from ledfx.effects.key_raindrops import KeyRaindrops
 from ledfx.effects.key_ripple import KeyRipple
 from ledfx.effects.key_rows import KeyRows
 from ledfx.effects.key_scanner import KeyScanner
-from ledfx.effects.key_snake import KeySnake
 from ledfx.effects.key_spectrogram import KeySpectrogram
 from ledfx.effects.key_spiral import KeySpiral
 from ledfx.effects.key_split import KeySplit
 from ledfx.effects.key_spotlight import KeySpotlight
 from ledfx.effects.key_storm import KeyStorm
 from ledfx.effects.key_strobe import KeyStrobe
+from ledfx.effects.key_timer import KeyTimer
+from ledfx.effects.key_tunnel import KeyTunnel
 from ledfx.effects.key_twinkle import KeyTwinkle
 from ledfx.effects.key_warp import KeyWarp
 from ledfx.effects.key_wave import KeyWave
 from ledfx.effects.mat_aurora import MatAurora
+from ledfx.effects.mat_battery import MatBattery
 from ledfx.effects.mat_beat_counter import MatBeatCounter
+from ledfx.effects.mat_binary import MatBinary
 from ledfx.effects.mat_breathe import MatBreathe
 from ledfx.effects.mat_chase import MatChase
 from ledfx.effects.mat_comets import MatComets
 from ledfx.effects.mat_converge import MatConverge
+from ledfx.effects.mat_drum_kit import MatDrumKit
+from ledfx.effects.mat_embers import MatEmbers
 from ledfx.effects.mat_fire import MatFire
 from ledfx.effects.mat_fireworks import MatFireworks
 from ledfx.effects.mat_flow import MatFlow
+from ledfx.effects.mat_fountain import MatFountain
 from ledfx.effects.mat_glitch import MatGlitch
 from ledfx.effects.mat_halfpipe import MatHalfpipe
+from ledfx.effects.mat_history import MatHistory
 from ledfx.effects.mat_lava_lamp import MatLavaLamp
+from ledfx.effects.mat_level import MatLevel
 from ledfx.effects.mat_meter import MatMeter
+from ledfx.effects.mat_neon import MatNeon
+from ledfx.effects.mat_note_color import MatNoteColor
+from ledfx.effects.mat_plasma import MatPlasma
+from ledfx.effects.mat_pop import MatPop
 from ledfx.effects.mat_pulse_line import MatPulseLine
 from ledfx.effects.mat_rain import MatRain
 from ledfx.effects.mat_rainbow import MatRainbow
@@ -86,64 +131,32 @@ from ledfx.effects.mat_sparkle import MatSparkle
 from ledfx.effects.mat_spectrum import MatSpectrum
 from ledfx.effects.mat_splash import MatSplash
 from ledfx.effects.mat_split import MatSplit
+from ledfx.effects.mat_spotlight import MatSpotlight
+from ledfx.effects.mat_starfield import MatStarfield
+from ledfx.effects.mat_storm import MatStorm
 from ledfx.effects.mat_strobe import MatStrobe
+from ledfx.effects.mat_tempo_gauge import MatTempoGauge
 from ledfx.effects.mat_timer import MatTimer
+from ledfx.effects.mat_tug_of_war import MatTugOfWar
+from ledfx.effects.mat_wave import MatWave
+from ledfx.effects.mouse_meter import MouseMeter
 from ledfx.effects.mouse_mood import MouseMood
 from ledfx.effects.mouse_pulse import MousePulse
-from ledfx.effects.pump_aurora import PumpAurora
-from ledfx.effects.pump_beacon import PumpBeacon
-from ledfx.effects.pump_beat_ring import PumpBeatRing
-from ledfx.effects.pump_boil import PumpBoil
-from ledfx.effects.pump_breathe import PumpBreathe
-from ledfx.effects.pump_clock import PumpClock
+from ledfx.effects.mouse_rainbow import MouseRainbow
+from ledfx.effects.mouse_strobe import MouseStrobe
 from ledfx.effects.pump_collide import PumpCollide
-from ledfx.effects.pump_compass import PumpCompass
-from ledfx.effects.pump_drip import PumpDrip
-from ledfx.effects.pump_eye import PumpEye
-from ledfx.effects.pump_fireball import PumpFireball
-from ledfx.effects.pump_galaxy import PumpGalaxy
-from ledfx.effects.pump_gauge import PumpGauge
-from ledfx.effects.pump_heart import PumpHeart
-from ledfx.effects.pump_loop import PumpLoop
-from ledfx.effects.pump_mandala import PumpMandala
-from ledfx.effects.pump_note_wheel import PumpNoteWheel
-from ledfx.effects.pump_orbit import PumpOrbit
-from ledfx.effects.pump_radar import PumpRadar
-from ledfx.effects.pump_sonar import PumpSonar
-from ledfx.effects.pump_spectrum import PumpSpectrum
+from ledfx.effects.pump_comets import PumpComets
 from ledfx.effects.pump_split import PumpSplit
+from ledfx.effects.pump_storm import PumpStorm
 from ledfx.effects.pump_strobe import PumpStrobe
-from ledfx.effects.pump_swirl import PumpSwirl
-from ledfx.effects.pump_tempo_dial import PumpTempoDial
-from ledfx.effects.pump_thermometer import PumpThermometer
-from ledfx.effects.pump_turbine import PumpTurbine
-from ledfx.effects.ram_aurora import RamAurora
-from ledfx.effects.ram_bar_counter import RamBarCounter
-from ledfx.effects.ram_battery import RamBattery
-from ledfx.effects.ram_blocks import RamBlocks
 from ledfx.effects.ram_bounce import RamBounce
-from ledfx.effects.ram_breathe import RamBreathe
 from ledfx.effects.ram_center_pulse import RamCenterPulse
-from ledfx.effects.ram_comets import RamComets
-from ledfx.effects.ram_elevators import RamElevators
+from ledfx.effects.ram_drum_kit import RamDrumKit
 from ledfx.effects.ram_fire import RamFire
-from ledfx.effects.ram_fireworks import RamFireworks
-from ledfx.effects.ram_glitch import RamGlitch
-from ledfx.effects.ram_lava_lamp import RamLavaLamp
 from ledfx.effects.ram_meter import RamMeter
 from ledfx.effects.ram_mirror_meter import RamMirrorMeter
 from ledfx.effects.ram_plasma import RamPlasma
-from ledfx.effects.ram_pong import RamPong
-from ledfx.effects.ram_rain import RamRain
-from ledfx.effects.ram_rising import RamRising
-from ledfx.effects.ram_scanner import RamScanner
-from ledfx.effects.ram_snake import RamSnake
-from ledfx.effects.ram_sparkle import RamSparkle
-from ledfx.effects.ram_stairs import RamStairs
 from ledfx.effects.ram_strobe import RamStrobe
-from ledfx.effects.ram_timer import RamTimer
-from ledfx.effects.ram_waterfall import RamWaterfall
-from ledfx.effects.ram_wave import RamWave
 from ledfx.effects.rig_wave import RigWave
 from ledfx.effects.utils.corsair import (
     BAR,
@@ -171,10 +184,7 @@ CORSAIR_EFFECTS: list[type[AudioReactiveEffect]] = [
     FanRotor,
     FanMeter,
     FanCascade,
-    PumpSwirl,
-    PumpGauge,
     RamMeter,
-    RamWave,
     KeyRipple,
     KeyEqualizer,
     MatSplash,
@@ -190,28 +200,12 @@ CORSAIR_EFFECTS: list[type[AudioReactiveEffect]] = [
     FanSparks,
     FanStack,
     FanVortex,
-    PumpBoil,
-    PumpClock,
-    PumpEye,
-    PumpHeart,
-    PumpNoteWheel,
-    PumpRadar,
     PumpSplit,
-    PumpTempoDial,
-    PumpThermometer,
-    PumpTurbine,
-    RamBarCounter,
-    RamBlocks,
     RamCenterPulse,
-    RamElevators,
     RamFire,
     RamMirrorMeter,
     RamPlasma,
-    RamRising,
-    RamScanner,
-    RamSparkle,
     KeyFire,
-    KeyGhostTypist,
     KeyPlasma,
     KeyRadar,
     KeyRain,
@@ -245,45 +239,16 @@ CORSAIR_EFFECTS: list[type[AudioReactiveEffect]] = [
     FanTimer,
     FanTrafficLight,
     FanYinYang,
-    PumpAurora,
-    PumpBeacon,
-    PumpBeatRing,
-    PumpBreathe,
     PumpCollide,
-    PumpCompass,
-    PumpDrip,
-    PumpFireball,
-    PumpGalaxy,
-    PumpLoop,
-    PumpMandala,
-    PumpOrbit,
-    PumpSonar,
-    PumpSpectrum,
     PumpStrobe,
-    RamAurora,
-    RamBattery,
     RamBounce,
-    RamBreathe,
-    RamComets,
-    RamFireworks,
-    RamGlitch,
-    RamLavaLamp,
-    RamPong,
-    RamRain,
-    RamSnake,
-    RamStairs,
     RamStrobe,
-    RamTimer,
-    RamWaterfall,
     KeyAurora,
     KeyBreathe,
-    KeyCheckerboard,
-    KeyComets,
     KeyFireworks,
     KeyLavaLamp,
     KeyPong,
     KeyRainbow,
-    KeySnake,
     KeySpectrogram,
     KeySpiral,
     KeySplit,
@@ -305,6 +270,66 @@ CORSAIR_EFFECTS: list[type[AudioReactiveEffect]] = [
     MatStrobe,
     MatTimer,
     MouseMood,
+    FanBarCounter,
+    FanBattery,
+    FanClock,
+    FanColorWheel,
+    FanComets,
+    FanEyes,
+    FanFireworks,
+    FanGauges,
+    FanGlitch,
+    FanKaleidoscope,
+    FanNoteColor,
+    FanPlasma,
+    FanPop,
+    FanRainbow,
+    FanRipple,
+    FanRiser,
+    FanScanner,
+    FanSnake,
+    FanTurntables,
+    FanWave,
+    PumpComets,
+    PumpStorm,
+    RamDrumKit,
+    KeyBounce,
+    KeyBouncingLogo,
+    KeyColorWheel,
+    KeyDrumKit,
+    KeyFireflies,
+    KeyFountain,
+    KeyGlitch,
+    KeyKaleidoscope,
+    KeyLevel,
+    KeyMarquee,
+    KeyMeteors,
+    KeyNotes,
+    KeyOcean,
+    KeyRadialEq,
+    KeyRaindrops,
+    KeyTimer,
+    KeyTunnel,
+    MatBattery,
+    MatBinary,
+    MatDrumKit,
+    MatEmbers,
+    MatFountain,
+    MatHistory,
+    MatLevel,
+    MatNeon,
+    MatNoteColor,
+    MatPlasma,
+    MatPop,
+    MatSpotlight,
+    MatStarfield,
+    MatStorm,
+    MatTempoGauge,
+    MatTugOfWar,
+    MatWave,
+    MouseMeter,
+    MouseRainbow,
+    MouseStrobe,
 ]
 # The pixel counts of the gear as the bridge streams it, and of its two groups
 GEAR_COUNTS = [16, 24, 40, 48, 112, 134, 262]
@@ -456,31 +481,6 @@ def test_fan_cascade_falls_from_the_top_fan_to_the_bottom_one() -> None:
     )
 
 
-def test_pump_swirl_heats_up_with_loud_music() -> None:
-    loud = make(PumpSwirl, 24, heat_up=3.0)
-    pixels = run(loud, 2, FakeAudio(lows=1.0, mids=1.0, highs=1.0))
-    assert loud.heat > 0.8
-    assert pixels[:16, 0].sum() > pixels[:16, 2].sum()
-    calm = make(PumpSwirl, 24, heat_up=3.0)
-    pixels = run(calm, 2, FakeAudio(lows=0.0, mids=0.0, highs=0.0))
-    assert pixels[:16, 2].sum() > pixels[:16, 0].sum()
-
-
-def pump_lit(pixels: NDArray[np.float64]) -> int:
-    return int(np.count_nonzero(pixels[:16].max(axis=1) > 100))
-
-
-def test_pump_gauge_fills_with_the_volume_and_flashes_the_fans() -> None:
-    quiet = run(make(PumpGauge, 24), 1, FakeAudio(lows=0.1, mids=0.1, highs=0.1))
-    loud = run(make(PumpGauge, 24), 1, FakeAudio(lows=0.8, mids=0.8, highs=0.8))
-    assert pump_lit(loud) > pump_lit(quiet) + 4
-    effect = make(PumpGauge, 24)
-    flash = frame(effect, FakeAudio(beat=True))
-    # One radiator fan flashes white, the other stays dim
-    assert flash[16:20].min() > 200
-    assert flash[20:24].max() < 50
-
-
 def test_ram_meter_gives_each_stick_its_band() -> None:
     effect = make(RamMeter, 40, peaks=False)
     run(effect, 1, FakeAudio(lows=1.0, mids=1.0, highs=1.0))
@@ -491,21 +491,6 @@ def test_ram_meter_gives_each_stick_its_band() -> None:
     ]
     assert lit[0] >= 9
     assert lit[0] > lit[1] > lit[3]
-
-
-def test_ram_wave_sets_each_stick_at_its_own_height() -> None:
-    effect = make(RamWave, 40, spread=0.25)
-    run(effect, 1, FakeAudio(lows=1.0, mids=1.0, highs=1.0))
-    heights = effect.heights()
-    assert np.ptp(heights) > 0.3
-    pixels = effect.pixels
-    assert pixels is not None
-    # On each stick the brightest LED is where the wave is
-    ram = ram_layout(40)
-    for stick in range(4):
-        mine = np.flatnonzero(ram.stick == stick)
-        top = mine[np.argmax(pixels[mine].sum(axis=1))]
-        assert abs(ram.height[top] - heights[stick]) <= 1 / 9 + 1e-9
 
 
 def test_key_ripple_spreads_from_the_middle_and_flashes_the_logo() -> None:
@@ -704,101 +689,6 @@ def test_fan_sparks_lights_rim_leds_on_each_hit() -> None:
     assert (fan_layout(48).ring[sparks] == FAN_RIM).all()
 
 
-@pytest.mark.parametrize("top_led", [0, 4])
-def test_pump_clock_points_its_hand_at_the_bar(top_led: int) -> None:
-    effect = plain(make(PumpClock, 24, top_led=top_led))
-    run(effect, 0.1, SILENCE)
-    effect.song.beats = 1.0
-    pixels = frame(effect)
-    # A quarter of the bar: a quarter of a turn clockwise from the top LED
-    assert int(np.argmax(pixels[:16].sum(axis=1))) == (top_led + 4) % 16
-    assert pixels[16:].max() < 100
-    effect.song.beats = 4.0
-    assert frame(effect)[16:].min() > 200
-
-
-def test_pump_radar_sweeps_with_the_bar_and_marks_hits() -> None:
-    effect = make(PumpRadar, 24)
-    run(effect, 0.1, SILENCE)
-    effect.song.beats = 1.0
-    pixels = frame(effect)
-    assert int(np.argmax(pixels[:16, 1])) == 4
-    frame(effect, FakeAudio(onset=True))
-    for _ in range(2):
-        effect.song.beats += 2.0
-        pixels = frame(effect)
-    # The sweep has passed the blip: it shows red on the green screen
-    assert (pixels[:16, 0] > pixels[:16, 1]).any()
-
-
-def test_pump_heart_beats_lub_dub() -> None:
-    effect = make(PumpHeart, 24)
-    lub = frame(effect, FakeAudio(beat=True)).copy()
-    between = run(effect, 0.1, SILENCE).copy()
-    # The radiator fans echo the pump a moment later
-    assert lub[16:, 0].max() < lub[:16, 0].max() / 3
-    echo = run(effect, 0.034, SILENCE)
-    assert echo[16:, 0].max() > echo[:16, 0].max()
-    dub = run(effect, 0.05, SILENCE)
-    assert lub[:16, 0].max() > dub[:16, 0].max() > between[:16, 0].max()
-
-
-def test_pump_turbine_spins_up_with_the_music() -> None:
-    loud = make(PumpTurbine, 24)
-    loud_pixels = run(loud, 2, LOUD)
-    quiet = make(PumpTurbine, 24)
-    quiet_pixels = run(quiet, 2, SILENCE)
-    assert loud.speed > 0.8
-    assert quiet.speed < 0.2
-    # The radiator fans are its speed gauge
-    assert np.count_nonzero(lit(loud_pixels[16:], 60)) > np.count_nonzero(
-        lit(quiet_pixels[16:], 60)
-    )
-
-
-def test_pump_thermometer_fills_the_ring_from_the_bottom() -> None:
-    warm = run(make(PumpThermometer, 24), 3, FakeAudio(lows=0.2, mids=0.2, highs=0.2))
-    # With the ring's top LED first, the bottom is LED 8
-    assert lit(warm[8:9]).all()
-    assert not lit(warm[0:1]).any()
-    hot = run(make(PumpThermometer, 24), 3, LOUD)
-    assert lit(hot[:16]).all()
-
-
-@pytest.mark.parametrize("audio, side", [(BASS, "left"), (TREBLE, "right")])
-def test_pump_eye_looks_towards_the_louder_end(audio: FakeAudio, side: str) -> None:
-    pixels = run(make(PumpEye, 24, blink_every=32), 1, audio)
-    iris = pixels[:16, 2] - pixels[:16, 0]
-    right, left = iris[1:8].sum(), iris[9:16].sum()
-    assert (left > right) if side == "left" else (right > left)
-
-
-def test_pump_tempo_dial_reads_the_songs_tempo() -> None:
-    def dial(rate: float) -> int:
-        effect = make(PumpTempoDial, 24)
-        effect.song.rate = rate
-        return int(np.count_nonzero(lit(frame(effect)[:16], 60)))
-
-    assert dial(3.0) > dial(1.0) + 8
-
-
-def test_pump_boil_bubbles_more_as_it_gets_louder() -> None:
-    loud = make(PumpBoil, 24)
-    run(loud, 1, LOUD)
-    quiet = make(PumpBoil, 24)
-    run(quiet, 1, SILENCE)
-    assert loud._bubbles.sum() > quiet._bubbles.sum() + 0.5
-
-
-@pytest.mark.parametrize("note, top_led, led", [(60, 0, 0), (67, 0, 9), (60, 4, 4)])
-def test_pump_note_wheel_lights_the_note_heard(
-    note: int, top_led: int, led: int
-) -> None:
-    effect = make(PumpNoteWheel, 24, top_led=top_led)
-    pixels = run(effect, 0.3, FakeAudio(pitch=note))
-    assert int(np.argmax(pixels[:16].sum(axis=1))) == led
-
-
 def test_pump_split_shows_the_bass_left_and_the_treble_right() -> None:
     pixels = run(make(PumpSplit, 24), 1, BASS)
     assert lit(pixels[9:16]).all()
@@ -811,33 +701,12 @@ def stick_sums(pixels: NDArray[np.float64]) -> list[float]:
     return [float(pixels[ram.stick == stick].sum()) for stick in range(4)]
 
 
-def test_ram_bar_counter_lights_the_stick_of_the_beat() -> None:
-    effect = plain(make(RamBarCounter, 40))
-    run(effect, 0.1, SILENCE)
-    for beat in (2, 3, 0):
-        effect.song.beats = 4.0 + beat
-        assert int(np.argmax(stick_sums(frame(effect)))) == beat
-
-
 def test_ram_fire_burns_from_the_bottom_of_the_sticks() -> None:
     loud = run(make(RamFire, 40, flicker=0.0), 1, BASS)
     quiet = run(make(RamFire, 40, flicker=0.0), 1, SILENCE)
     assert loud.sum() > quiet.sum() * 1.3
     ram = ram_layout(40)
     assert loud[ram.height == 0].sum() > loud[ram.height == 1].sum() * 2
-
-
-def test_ram_elevators_send_a_car_to_its_floor_on_the_beat() -> None:
-    effect = plain(make(RamElevators, 40))
-    frame(effect, FakeAudio(beat=True))
-    called = int(np.argmax(effect._floors))
-    floor = float(effect._floors[called])
-    assert floor > 0.2
-    pixels = run(effect, 2, SILENCE)
-    ram = ram_layout(40)
-    assert brightest(pixels, ram.height, ram.stick == called) == pytest.approx(
-        floor, abs=0.15
-    )
 
 
 def test_ram_center_pulse_spreads_from_the_middle_of_the_bank() -> None:
@@ -859,46 +728,6 @@ def test_ram_mirror_meter_spreads_the_bass_on_the_outer_sticks() -> None:
     # The inner sticks get only a share of the bass, round their middles
     assert on[~outer].sum() < on[outer].sum() / 2
     assert not on[~outer & (ram.height > 0.9)].any()
-
-
-def test_ram_scanner_runs_each_stick_a_little_behind_the_last() -> None:
-    effect = plain(make(RamScanner, 40, beats_per_sweep=1.0, stagger=0.25))
-    run(effect, 0.05, SILENCE)
-    effect.song.beats = 0.6
-    pixels = frame(effect)
-    ram = ram_layout(40)
-    assert brightest(pixels, ram.height, ram.stick == 0) == pytest.approx(0.6, abs=0.12)
-    assert brightest(pixels, ram.height, ram.stick == 2) == pytest.approx(0.1, abs=0.12)
-
-
-def test_ram_rising_bubbles_climb_the_sticks() -> None:
-    effect = make(RamRising, 40)
-    frame(effect, FakeAudio(beat=True, lows=0.0, mids=0.0, highs=0.0))
-    assert len(effect._bubbles) == 2
-    assert (effect._bubbles[:, 1] < 0.05).all()
-    run(effect, 0.4, SILENCE)
-    assert (effect._bubbles[:2, 1] > 0.15).all()
-
-
-def test_ram_sparkle_lights_a_whole_stick_on_a_hit() -> None:
-    effect = make(RamSparkle, 40)
-    pixels = frame(effect, FakeAudio(onset=True, lows=0.0, mids=0.0, highs=0.0))
-    flashed = pixels.min(axis=1) > 200
-    assert np.count_nonzero(flashed) == 10
-    assert np.unique(ram_layout(40).stick[flashed]).size == 1
-
-
-def test_ram_blocks_stack_up_one_block_a_beat() -> None:
-    effect = make(RamBlocks, 40, block_size=5)
-    for _ in range(7):
-        pixels = run(effect, 0.5, FakeAudio(beat=True))
-    assert int(effect._stacked.sum()) == 35
-    assert np.count_nonzero(lit(pixels, 50)) == 35
-    run(effect, 0.42, FakeAudio(beat=True))
-    # The bank is full: it flashes white, then empties
-    assert effect._clearing > 0
-    run(effect, 0.6, SILENCE)
-    assert int(effect._stacked.sum()) == 0
 
 
 def test_ram_plasma_glows_brighter_with_the_bass() -> None:
@@ -979,17 +808,6 @@ def test_key_rows_stretch_the_bass_row_further_than_the_treble() -> None:
     on = lit(pixels)
     assert on[rows == count - 1].mean() > 0.9
     assert on[board.zone == BAR].mean() < 0.4
-
-
-def test_key_ghost_typist_strikes_a_key_on_each_hit() -> None:
-    effect = make(KeyGhostTypist, 134)
-    pixels = frame(effect, FakeAudio(onset=True, lows=0.0, mids=0.0, highs=0.0))
-    struck = lit(pixels)
-    assert np.count_nonzero(struck) == 1
-    assert board_mask(KEY)[struck].all()
-    busy = make(KeyGhostTypist, 134)
-    run(busy, 2, LOUD)
-    assert np.count_nonzero(busy._pressed > 0.05) > 3
 
 
 def test_key_plasma_glows_brighter_with_the_bass() -> None:
@@ -1296,110 +1114,12 @@ def test_fan_storm_strikes_a_fan_and_flickers_again() -> None:
     assert again > dimmed
 
 
-def rising(size: int) -> NDArray[np.float64]:
-    return np.linspace(0.2, 1.0, size)
-
-
-def treble_heavy(filtered: bool = False, size: int = 0) -> NDArray[np.float64]:
-    return rising(size or 24)
-
-
-def test_pump_compass_points_west_for_bass_and_east_for_treble() -> None:
-    bassy = make(PumpCompass, 24)
-    run(bassy, 2, LOUD)
-    assert bassy.needle < -0.02
-    bright = make(PumpCompass, 24)
-    vars(bright)["melbank"] = treble_heavy
-    run(bright, 2, LOUD)
-    assert bright.needle > 0.02
-
-
-def test_pump_beat_ring_fills_a_step_a_beat() -> None:
-    effect = plain(make(PumpBeatRing, 24, beats_per_ring=16))
-    run(effect, 0.05, SILENCE)
-    effect.song.beats = 5.0
-    pixels = frame(effect)
-    assert pixels[5].min() > 250
-    assert lit(pixels[:5], 100).all()
-    assert not lit(pixels[6:16], 50).any()
-
-
-def test_pump_orbit_flashes_the_fans_where_the_moons_meet() -> None:
-    effect = make(PumpOrbit, 24)
-    flashes = 0.0
-    for _ in range(30):
-        flashes = max(flashes, float(frame(effect, LOUD)[16:].max()))
-    assert flashes > 150
-
-
-def test_pump_spectrum_puts_the_bass_at_the_bottom() -> None:
-    pixels = run(plain(make(PumpSpectrum, 24, gain=1.0)), 0.5, LOUD)
-    assert pixels[8].sum() > pixels[0].sum() * 2
-    assert pixels[16:20].sum() > pixels[20:24].sum()
-
-
-def test_pump_breathe_breathes_the_pump_against_the_radiator() -> None:
-    effect = plain(make(PumpBreathe, 24, beats_per_breath=4.0))
-    run(effect, 0.05, LOUD)
-    effect.song.beats = 2.0
-    pixels = frame(effect, LOUD)
-    assert pixels[:16].mean() > pixels[16:].mean() * 3
-
-
-def test_pump_beacon_sweeps_with_the_bar_and_lights_the_fan_it_passes() -> None:
-    effect = make(PumpBeacon, 24)
-    run(effect, 0.05, SILENCE)
-    effect.song.beats = 1.0
-    pixels = frame(effect)
-    assert int(np.argmax(pixels[:16].sum(axis=1))) == 4
-    # A quarter turn round: the beam points at the fan on the right
-    assert pixels[20:24].sum() > pixels[16:20].sum() * 3
-
-
-def test_pump_galaxy_turns_faster_when_loud() -> None:
-    loud = make(PumpGalaxy, 24)
-    run(loud, 1, LOUD)
-    quiet = make(PumpGalaxy, 24)
-    run(quiet, 1, SILENCE)
-    assert loud._turn > quiet._turn * 2
-
-
 def test_pump_collide_bursts_where_the_pulses_meet() -> None:
     effect = make(PumpCollide, 24, speed=0.8)
     frame(effect, FakeAudio(onset=True, lows=0.0, mids=0.0, highs=0.0))
     assert len(effect._pulses) == 1
     assert run(effect, 0.2, SILENCE)[16:].max() < 20
     assert run(effect, 0.5, SILENCE)[16:].max() > 100
-
-
-def test_pump_mandala_repeats_round_the_ring() -> None:
-    pixels = run(make(PumpMandala, 24, folds=4), 0.5, LOUD)
-    np.testing.assert_allclose(pixels[:16], np.roll(pixels[:16], 4, axis=0), atol=1e-6)
-
-
-def test_pump_fireball_races_with_the_bass() -> None:
-    loud = make(PumpFireball, 24)
-    run(loud, 0.5, BASS)
-    quiet = make(PumpFireball, 24)
-    run(quiet, 0.5, SILENCE)
-    assert loud.at > quiet.at + 0.3
-
-
-def test_pump_aurora_glows_with_the_music() -> None:
-    loud = run(make(PumpAurora, 24), 1, LOUD)
-    quiet = run(make(PumpAurora, 24), 1, SILENCE)
-    assert loud.sum() > quiet.sum() * 1.5
-
-
-def test_pump_drip_lets_a_drop_go_on_the_beat_and_it_splashes_below() -> None:
-    effect = make(PumpDrip, 24)
-    run(effect, 1, SILENCE)
-    assert effect.forming > 0.3
-    frame(effect, FakeAudio(beat=True))
-    assert effect.forming == 0
-    assert effect._drops.size == 1
-    assert run(effect, 0.3, SILENCE)[16:].max() < 20
-    assert run(effect, 0.7, SILENCE)[16:].max() > 100
 
 
 def test_pump_strobe_flashes_the_pump_on_beats_and_the_fans_on_hits() -> None:
@@ -1411,51 +1131,7 @@ def test_pump_strobe_flashes_the_pump_on_beats_and_the_fans_on_hits() -> None:
     assert hit[:16].max() == 0
 
 
-def test_pump_loop_carries_each_pulse_from_the_pump_to_the_radiator() -> None:
-    effect = make(PumpLoop, 24, speed=1.0)
-    early = frame(effect, FakeAudio(beat=True, lows=0.0, mids=0.0, highs=0.0))
-    assert early[0].max() > 200
-    assert early[16:].max() < 50
-    later = run(effect, 1.1, SILENCE)
-    assert later[16:].max() > 100
-
-
-def test_pump_sonar_pings_down_the_ring_and_finds_the_radiator() -> None:
-    effect = make(PumpSonar, 24)
-    early = frame(effect, FakeAudio(beat=True))
-    assert early[0].max() > early[8].max()
-    assert run(effect, 0.3, SILENCE)[16:].max() < 20
-    assert run(effect, 0.3, SILENCE)[16:].max() > 100
-
-
 RAM = ram_layout(40)
-
-
-def test_ram_waterfall_lets_the_music_flow_down_the_sticks() -> None:
-    effect = plain(make(RamWaterfall, 40, gain=1.0))
-    early = run(effect, 0.05, LOUD).copy()
-    top, bottom = RAM.height == 1, RAM.height == 0
-    assert early[top & (RAM.stick == 0)].sum() > early[top & (RAM.stick == 3)].sum()
-    assert early[bottom].max() < 10
-    later = run(effect, 2, LOUD)
-    assert later[bottom & (RAM.stick == 0)].max() > 100
-
-
-def test_ram_rain_falls_and_splashes_at_the_bottom() -> None:
-    effect = make(RamRain, 40, rain=0.2)
-    frame(effect, FakeAudio(onset=True, lows=0.0, mids=0.0, highs=0.0))
-    assert len(effect._drops) >= 2
-    assert (effect._drops[:, 1] > 0.9).all()
-    run(effect, 2, SILENCE)
-    assert effect._puddles.max() > 0
-
-
-def test_ram_breathe_runs_the_breath_across_the_sticks() -> None:
-    effect = plain(make(RamBreathe, 40, beats_per_breath=4.0, spread=0.25))
-    run(effect, 0.05, LOUD)
-    effect.song.beats = 2.0
-    sums = stick_sums(frame(effect, LOUD))
-    assert sums[0] > sums[2] * 2
 
 
 @pytest.mark.parametrize(
@@ -1471,99 +1147,12 @@ def test_ram_strobe_flashes_the_sticks_in_order(order: str, sticks: list[int]) -
     assert seen == sticks
 
 
-def test_ram_snake_grows_a_led_each_beat() -> None:
-    effect = plain(make(RamSnake, 40))
-    assert np.count_nonzero(lit(run(effect, 0.2, SILENCE))) == 3
-    frame(effect, FakeAudio(beat=True))
-    assert np.count_nonzero(lit(run(effect, 0.2, SILENCE))) == 4
-
-
 def test_ram_bounce_throws_the_bass_ball_highest() -> None:
     effect = make(RamBounce, 40)
     run(effect, 0.2, BASS)
     frame(effect, FakeAudio(beat=True, lows=1.0, mids=0.0, highs=0.0))
     run(effect, 0.25, BASS)
     assert effect.balls[0] > effect.balls[3] + 0.1
-
-
-def test_ram_lava_lamp_glows_hotter_with_the_bass() -> None:
-    loud = run(make(RamLavaLamp, 40), 1, BASS)
-    quiet = run(make(RamLavaLamp, 40), 1, SILENCE)
-    assert loud.sum() > quiet.sum()
-
-
-def test_ram_aurora_glows_with_the_music() -> None:
-    loud = run(make(RamAurora, 40), 1, LOUD)
-    quiet = run(make(RamAurora, 40), 1, SILENCE)
-    assert loud.sum() > quiet.sum() * 1.5
-
-
-def test_ram_battery_charges_the_sticks_one_after_another() -> None:
-    effect = make(RamBattery, 40, charge_rate=2.0)
-    run(effect, 1.2, LOUD)
-    assert effect.charges[:2].tolist() == [1.0, 1.0]
-    assert effect.charges[3] == 0
-    quiet = make(RamBattery, 40)
-    run(quiet, 1, SILENCE)
-    assert not quiet.charges.any()
-    run(effect, 1.0, LOUD)
-    # All charged: the bank flashes white, then empties
-    assert effect._full > 0
-    run(effect, 0.7, SILENCE)
-    assert not effect.charges.any()
-
-
-def test_ram_comets_climb_the_sticks() -> None:
-    effect = make(RamComets, 40)
-    early = run(effect, 0.1, FakeAudio(onset=True))
-    low = brightest(early, RAM.height, np.ones(40, dtype=bool))
-    later = run(effect, 0.3, SILENCE)
-    assert brightest(later, RAM.height, np.ones(40, dtype=bool)) > low + 0.3
-
-
-def test_ram_pong_keeps_the_ball_in_play() -> None:
-    effect = make(RamPong, 40)
-    for _ in range(4):
-        run(effect, 1, FakeAudio(beat=True))
-        assert 0 <= effect.across <= 3
-        assert 0 <= effect.up <= 1
-    assert effect._boost > 1
-
-
-def test_ram_timer_runs_down_from_the_right_stick() -> None:
-    effect = plain(make(RamTimer, 40, beats=16))
-    # Past the flash of the first fill
-    run(effect, 1.5, SILENCE)
-    effect.song.beats = 4.0
-    on = lit(frame(effect))
-    assert on[RAM.stick < 3].all()
-    assert not on[RAM.stick == 3].any()
-
-
-def test_ram_stairs_turn_round_on_each_beat() -> None:
-    effect = make(RamStairs, 40)
-    run(effect, 1, LOUD)
-    assert (np.diff(effect.steps) > 0).all()
-    frame(effect, FakeAudio(beat=True, lows=1.0, mids=1.0, highs=1.0))
-    run(effect, 1, LOUD)
-    assert (np.diff(effect.steps) < 0).all()
-
-
-def test_ram_glitch_inverts_a_stick_on_a_hit() -> None:
-    effect = make(RamGlitch, 40)
-    pixels = frame(effect, FakeAudio(onset=True, lows=0.0, mids=0.0, highs=0.0))
-    inverted = pixels.min(axis=1) > 180
-    assert np.count_nonzero(inverted) == 10
-    assert np.unique(RAM.stick[inverted]).size == 1
-
-
-def test_ram_fireworks_launch_on_the_beat_and_burst() -> None:
-    effect = make(RamFireworks, 40)
-    frame(effect, FakeAudio(beat=True))
-    assert len(effect._rockets) == 1
-    run(effect, 0.5, SILENCE)
-    assert len(effect._rockets) == 0
-    assert len(effect._bursts) == 1
 
 
 BOARD = keyboard_layout(134)
@@ -1580,16 +1169,6 @@ def test_key_warp_streams_faster_when_loud() -> None:
     loud_moved, quiet_moved = loud._distances - start, quiet._distances - start
     kept = (loud_moved > 0) & (quiet_moved > 0)
     assert loud_moved[kept].sum() > quiet_moved[kept].sum() * 2
-
-
-def test_key_snake_grows_on_the_beat() -> None:
-    effect = plain(make(KeySnake, 134))
-    run(effect, 1, LOUD)
-    assert len(effect.body) == 4
-    frame(effect, FakeAudio(beat=True, lows=1.0, mids=1.0, highs=1.0))
-    pixels = run(effect, 0.5, LOUD)
-    assert len(effect.body) == 5
-    assert np.count_nonzero(lit(pixels, 60)) >= 4
 
 
 def test_key_fireworks_launch_from_the_front_and_burst() -> None:
@@ -1675,16 +1254,6 @@ def test_key_storm_strikes_from_the_light_bar_to_the_front() -> None:
     assert bolt[BOARD.y > 0.7].any()
 
 
-def test_key_comets_fly_along_one_row() -> None:
-    effect = make(KeyComets, 134)
-    frame(effect, FakeAudio(onset=True, lows=0.0, mids=0.0, highs=0.0))
-    pixels = run(effect, 0.2, SILENCE)
-    rows, _ = keyboard_rows(BOARD)
-    on = lit(pixels, 50)
-    assert on.any()
-    assert np.unique(rows[on]).size == 1
-
-
 def test_key_split_fills_the_bass_from_the_left_edge() -> None:
     pixels = run(make(KeySplit, 134), 1, BASS)
     on = lit(pixels)
@@ -1697,19 +1266,6 @@ def test_key_spiral_turns_with_the_song() -> None:
     before = run(effect, 0.05, LOUD).copy()
     effect.song.beats = 1.0
     assert not np.allclose(before, frame(effect, LOUD))
-
-
-def test_key_checkerboard_swaps_its_squares_on_the_beat() -> None:
-    effect = make(KeyCheckerboard, 134)
-    first = effect.squares()
-    assert first.any()
-    assert not first.all()
-    before = frame(effect, SILENCE).copy()
-    after = frame(effect, FakeAudio(beat=True))
-    # A pink square turns blue
-    key = int(np.flatnonzero(first)[0])
-    assert before[key, 0] > before[key, 2]
-    assert after[key, 2] > after[key, 0]
 
 
 HEIGHT = mat_height(MAT)
@@ -1869,3 +1425,513 @@ def test_ram_meter_takes_its_colors_from_the_settings() -> None:
     assert np.unique(ram.stick[peaks]).size == 4
     assert (pixels[~peaks, 2] > 200).all()
     assert pixels[~peaks, :2].max() == 0
+
+
+# Twenty more for each device
+
+
+def clock_at(
+    hours: float, minutes: float, seconds: float
+) -> Callable[[], tuple[float, float, float]]:
+    def clock() -> tuple[float, float, float]:
+        return hours, minutes, seconds
+
+    return clock
+
+
+QUIET_HIT = FakeAudio(onset=True, lows=0.0, mids=0.0, highs=0.0)
+
+
+def rim_of(fan: int) -> NDArray[np.bool_]:
+    return RIM & (FANS.fan == fan)
+
+
+def test_fan_clock_shows_the_hours_minutes_and_seconds() -> None:
+    effect = make(FanClock, 48)
+    vars(effect)["clock"] = clock_at(3.0, 15.0, 30.0)
+    pixels = frame(effect)
+    assert brightest(pixels, FANS.angle, rim_of(0)) == pytest.approx(0.25)
+    assert brightest(pixels, FANS.angle, rim_of(1)) == pytest.approx(0.25)
+    assert brightest(pixels, FANS.angle, rim_of(2)) == pytest.approx(0.5)
+
+
+def test_fan_color_wheel_turns_each_fan_a_third_further() -> None:
+    pixels = frame(make(FanColorWheel, 48), LOUD)
+    top_fan = np.flatnonzero(rim_of(0) & np.isclose(FANS.angle, 4 / 12, atol=0.01))[0]
+    next_fan = np.flatnonzero(rim_of(1) & np.isclose(FANS.angle, 0, atol=0.01))[0]
+    np.testing.assert_allclose(pixels[top_fan], pixels[next_fan], atol=1)
+    assert frame(make(FanColorWheel, 48), FakeAudio(beat=True))[HUB].min() > 200
+
+
+def test_fan_kaleidoscope_mirrors_each_rim() -> None:
+    pixels = run(make(FanKaleidoscope, 48, mirrors=3), 0.5, LOUD)
+    one = np.flatnonzero(rim_of(0) & np.isclose(FANS.angle, 1 / 12, atol=0.01))[0]
+    other = np.flatnonzero(rim_of(0) & np.isclose(FANS.angle, 11 / 12, atol=0.01))[0]
+    np.testing.assert_allclose(pixels[one], pixels[other], atol=1e-6)
+
+
+def test_fan_plasma_glows_brighter_with_the_bass() -> None:
+    loud = run(make(FanPlasma, 48), 1, BASS)
+    quiet = run(make(FanPlasma, 48), 1, SILENCE)
+    assert loud.sum() > quiet.sum() * 1.5
+
+
+def test_fan_ripple_spreads_from_a_hit() -> None:
+    effect = make(FanRipple, 48)
+    assert run(effect, 0.3, SILENCE).max() == 0
+    frame(effect, QUIET_HIT)
+    assert run(effect, 0.2, SILENCE).max() > 50
+
+
+def test_fan_wave_rises_with_the_song_and_the_volume() -> None:
+    effect = plain(make(FanWave, 48))
+    before = run(effect, 0.05, LOUD).copy()
+    effect.song.beats = 0.5
+    assert not np.allclose(before, frame(effect, LOUD))
+    quiet = run(plain(make(FanWave, 48)), 1, SILENCE)
+    assert run(plain(make(FanWave, 48)), 1, LOUD).sum() > quiet.sum() * 1.5
+
+
+def test_fan_fireworks_climb_and_burst_in_a_fan() -> None:
+    effect = make(FanFireworks, 48)
+    frame(effect, FakeAudio(beat=True))
+    assert len(effect._rockets) == 1
+    pixels = run(effect, 0.8, SILENCE)
+    assert len(effect._bursts) == 1
+    burst = int(effect._bursts[0, 0])
+    sums = fan_sums(pixels)
+    assert sums[burst] == max(sums)
+    assert sums[burst] > 0
+
+
+def test_fan_snake_grows_when_it_reaches_its_food() -> None:
+    effect = make(FanSnake, 48)
+    effect.food = 2.0
+    run(effect, 1.6, SILENCE)
+    assert effect.length == 4
+
+
+def test_fan_glitch_inverts_a_fan_on_a_hit() -> None:
+    pixels = frame(make(FanGlitch, 48), QUIET_HIT)
+    inverted = pixels.min(axis=1) > 180
+    assert np.count_nonzero(inverted) == 16
+    assert np.unique(FANS.fan[inverted]).size == 1
+
+
+def test_fan_comets_go_round_one_rim() -> None:
+    effect = make(FanComets, 48)
+    frame(effect, QUIET_HIT)
+    on = lit(run(effect, 0.2, SILENCE), 30)
+    assert on.any()
+    assert RIM[on].all()
+    assert np.unique(FANS.fan[on]).size == 1
+
+
+def test_fan_rainbow_stands_up_the_stack_and_rises_with_the_song() -> None:
+    effect = make(FanRainbow, 48)
+    before = frame(effect, LOUD).copy()
+    height = stack_height(FANS)
+    assert not np.allclose(before[np.argmax(height)], before[np.argmin(height)])
+    effect.song.beats = 1.0
+    assert not np.allclose(before, frame(effect, LOUD))
+
+
+@pytest.mark.parametrize("audio, side", [(BASS, 0.75), (TREBLE, 0.25)])
+def test_fan_eyes_look_towards_the_louder_end(audio: FakeAudio, side: float) -> None:
+    pixels = run(make(FanEyes, 48, blink_every=32), 1, audio)
+    iris = pixels[:, 2] - pixels[:, 0]
+    assert brightest(
+        np.column_stack((iris, iris, iris)), FANS.angle, rim_of(0)
+    ) == pytest.approx(side, abs=0.17)
+
+
+def test_fan_battery_charges_the_fans_from_the_bottom_up() -> None:
+    effect = make(FanBattery, 48, charge_rate=2.0)
+    run(effect, 0.75, LOUD)
+    assert effect.charges[2] == 1
+    assert effect.charges[1] > 0
+    assert effect.charges[0] == 0
+    quiet = make(FanBattery, 48)
+    run(quiet, 1, SILENCE)
+    assert not quiet.charges.any()
+
+
+def test_fan_gauges_read_the_bass_on_the_bottom_fan() -> None:
+    effect = make(FanGauges, 48)
+    run(effect, 1, BASS)
+    assert effect.needles[2] > 0.8
+    assert effect.needles[0] < 0.1
+
+
+def test_fan_riser_builds_up_and_drops() -> None:
+    effect = plain(make(FanRiser, 48, beats_per_build=16))
+    run(effect, 0.05, SILENCE)
+    effect.song.beats = 2.0
+    early = frame(effect).sum()
+    effect.song.beats = 14.0
+    late = frame(effect).sum()
+    assert late > early * 3
+    effect.song.beats = 16.0
+    assert frame(effect).min() > 200
+
+
+def test_fan_turntables_spin_with_the_song_and_scratch_on_hits() -> None:
+    effect = make(FanTurntables, 48, turns_per_beat=0.25)
+    run(effect, 0.05, SILENCE)
+    before = effect.turns.copy()
+    effect.song.beats = 4.0
+    frame(effect)
+    np.testing.assert_allclose(effect.turns - before, 1.0, atol=0.02)
+    frame(effect, QUIET_HIT)
+    assert np.count_nonzero(effect._scratched < 0.1) == 1
+
+
+def test_fan_pop_pops_a_fan_on_the_beat_and_the_hubs_on_hits() -> None:
+    effect = make(FanPop, 48)
+    pixels = frame(effect, FakeAudio(beat=True))
+    sums = fan_sums(pixels)
+    assert sorted(sums)[1] == 0
+    assert max(sums) > 0
+    assert frame(make(FanPop, 48), FakeAudio(onset=True))[HUB].min() > 200
+
+
+def test_fan_bar_counter_fills_a_slice_each_beat() -> None:
+    effect = plain(make(FanBarCounter, 48, beats_per_bar=4))
+
+    def rims_lit() -> list[int]:
+        on = lit(frame(effect))
+        return [int(np.count_nonzero(on[rim_of(fan)])) for fan in range(3)]
+
+    effect.song.beats = 1.0
+    assert rims_lit() == [6, 0, 0]
+    effect.song.beats = 5.0
+    assert rims_lit() == [12, 6, 0]
+
+
+def test_fan_scanner_sweeps_up_the_stack_with_the_song() -> None:
+    effect = plain(make(FanScanner, 48, beats_per_sweep=1.0))
+    run(effect, 0.05, SILENCE)
+    effect.song.beats = 0.5
+    height = stack_height(FANS)
+    assert brightest(frame(effect), height, np.ones(48, dtype=bool)) == pytest.approx(
+        0.5, abs=0.12
+    )
+
+
+@pytest.mark.parametrize("note, channel", [(60, 0), (64, 1)])
+def test_fan_note_color_takes_the_color_of_the_note(note: int, channel: int) -> None:
+    pixels = run(make(FanNoteColor, 48), 1.5, FakeAudio(pitch=note))
+    assert int(np.argmax(pixels[RIM].sum(axis=0))) == channel
+
+
+def test_pump_comets_go_round_the_ring_and_flash_the_radiator() -> None:
+    effect = make(PumpComets, 24)
+    pixels = frame(effect, QUIET_HIT)
+    assert pixels[16:].min() > 150
+    assert lit(run(effect, 0.2, SILENCE)[:16], 30).any()
+
+
+def test_pump_storm_strikes_the_ring() -> None:
+    effect = make(PumpStorm, 24)
+    run(effect, 0.1, SILENCE)
+    pixels = frame(effect, FakeAudio(onset=True))
+    assert pixels[:16].min(axis=1).max() > 200
+    assert pixels[16:].min() > 100
+
+
+def sticks_lit(pixels: NDArray[np.float64], above: float = 100) -> list[int]:
+    on = lit(pixels, above)
+    return [int(np.count_nonzero(on[RAM.stick == stick])) for stick in range(4)]
+
+
+def test_ram_drum_kit_fills_the_kick_stick_on_the_beat() -> None:
+    pixels = frame(
+        make(RamDrumKit, 40), FakeAudio(beat=True, lows=0.0, mids=0.0, highs=0.0)
+    )
+    counts = sticks_lit(pixels)
+    assert counts[0] == 10
+    assert counts[1] == counts[2] == 0
+
+
+def test_key_raindrops_land_and_ripple() -> None:
+    effect = make(KeyRaindrops, 134, rain=0.2)
+    frame(effect, QUIET_HIT)
+    assert len(effect._drops) >= 2
+    assert lit(run(effect, 0.2, SILENCE), 50).any()
+
+
+def test_key_ocean_rolls_rougher_with_the_bass() -> None:
+    loud = run(make(KeyOcean, 134), 1, BASS)
+    quiet = run(make(KeyOcean, 134), 1, SILENCE)
+    assert loud.sum() > quiet.sum() * 1.3
+
+
+def test_key_bounce_throws_the_balls_up_on_the_beat() -> None:
+    effect = make(KeyBounce, 134, balls=2)
+    run(effect, 1, SILENCE)
+    frame(effect, FakeAudio(beat=True))
+    assert (effect.balls[:, 3] > 0).all()
+    effect.update_config({"balls": 4})
+    frame(effect)
+    assert len(effect.balls) == 4
+
+
+def test_key_fireflies_glow_on_the_board() -> None:
+    effect = make(KeyFireflies, 134, fireflies=5)
+    seen = np.zeros(134, dtype=bool)
+    for _ in range(120):
+        seen |= lit(frame(effect, LOUD), 60)
+    assert seen.sum() >= 3
+    assert len(effect._places) == 5
+
+
+def test_key_glitch_inverts_the_board_on_a_hit() -> None:
+    assert frame(make(KeyGlitch, 134), QUIET_HIT).min() > 150
+
+
+def test_key_level_fills_the_board_from_the_front_row() -> None:
+    pixels = run(
+        plain(make(KeyLevel, 134)), 1, FakeAudio(lows=0.15, mids=0.15, highs=0.15)
+    )
+    on = lit(pixels)
+    assert on[KEYS & (BOARD.y > 0.9)].all()
+    assert not on[KEYS & (BOARD.y < 0.3)].any()
+
+
+def test_key_radial_eq_puts_the_bass_in_the_middle() -> None:
+    pixels = run(plain(make(KeyRadialEq, 134, gain=1.0)), 0.5, LOUD)
+    distance = np.hypot(BOARD.x - 0.5, (BOARD.y - 0.5) * 0.31)
+    assert pixels[distance < 0.1].mean() > pixels[distance > 0.4].mean() * 2
+
+
+def test_key_color_wheel_turns_with_the_song() -> None:
+    effect = make(KeyColorWheel, 134)
+    before = frame(effect, LOUD).copy()
+    effect.song.beats = 2.0
+    assert not np.allclose(before, frame(effect, LOUD))
+
+
+def test_key_notes_light_the_column_of_the_note() -> None:
+    pixels = run(make(KeyNotes, 134), 0.3, FakeAudio(pitch=60))
+    assert brightest(pixels, BOARD.x, KEYS) < 1 / 12
+
+
+def test_key_bouncing_logo_stays_on_the_board() -> None:
+    effect = make(KeyBouncingLogo, 134, speed=1.0)
+    hues: set[float] = set()
+    for _ in range(4):
+        run(effect, 1, LOUD)
+        hues.add(round(effect.hue, 3))
+        assert 0 < effect.logo[0] < 1
+    assert len(hues) > 1
+
+
+def test_key_drum_kit_lights_the_front_rows_on_the_kick() -> None:
+    pixels = frame(
+        make(KeyDrumKit, 134), FakeAudio(beat=True, lows=0.0, mids=0.0, highs=0.0)
+    )
+    assert lit(pixels[KEYS & (BOARD.y > 0.9)]).all()
+    assert not lit(pixels[KEYS & (BOARD.y < 0.5)]).any()
+
+
+def test_key_timer_runs_the_board_down_from_the_left() -> None:
+    effect = plain(make(KeyTimer, 134, beats=16))
+    run(effect, 1.5, SILENCE)
+    effect.song.beats = 8.0
+    on = lit(frame(effect))
+    assert not on[KEYS & (BOARD.x < 0.45)].any()
+    assert on[KEYS & (BOARD.x > 0.55)].all()
+
+
+def test_key_marquee_spells_out_the_text() -> None:
+    bitmap = text_bitmap("I")
+    assert bitmap.shape == (5, 4 + 6)
+    assert bitmap[0, :3].all()
+    assert bitmap[2].tolist()[:3] == [False, True, False]
+    assert lit(frame(make(KeyMarquee, 134, text="I"))).any()
+    assert not lit(frame(make(KeyMarquee, 134, text=" "))).any()
+
+
+def test_key_tunnel_rushes_out_with_the_song() -> None:
+    effect = make(KeyTunnel, 134)
+    before = frame(effect, LOUD).copy()
+    effect.song.beats = 0.5
+    assert not np.allclose(before, frame(effect, LOUD))
+
+
+def test_key_meteors_fall_on_a_hit() -> None:
+    effect = make(KeyMeteors, 134)
+    frame(effect, QUIET_HIT)
+    assert lit(run(effect, 0.3, SILENCE), 50).any()
+
+
+def test_key_kaleidoscope_glows_with_the_music() -> None:
+    loud = run(make(KeyKaleidoscope, 134), 1, LOUD)
+    quiet = run(make(KeyKaleidoscope, 134), 1, SILENCE)
+    assert loud.sum() > quiet.sum() * 1.5
+
+
+def test_key_fountain_throws_water_up_from_the_front_row() -> None:
+    effect = make(KeyFountain, 134)
+    frame(effect, FakeAudio(beat=True))
+    assert len(effect._drops) == 8
+    run(effect, 0.2, SILENCE)
+    assert (effect._drops[:, 1] > 0.05).all()
+
+
+def test_mat_wave_runs_round_the_pad_with_the_song() -> None:
+    effect = plain(make(MatWave, 16))
+    before = frame(effect, LOUD).copy()
+    effect.song.beats = 0.5
+    assert not np.allclose(before, frame(effect, LOUD))
+
+
+def test_mat_plasma_glows_brighter_with_the_bass() -> None:
+    loud = run(make(MatPlasma, 16), 1, BASS)
+    quiet = run(make(MatPlasma, 16), 1, SILENCE)
+    assert loud.sum() > quiet.sum() * 1.5
+
+
+def test_mat_level_fills_the_pad_from_the_left_tip() -> None:
+    pixels = run(
+        plain(make(MatLevel, 16)), 1, FakeAudio(lows=0.15, mids=0.15, highs=0.15)
+    )
+    on = lit(pixels)
+    assert on[EDGE & (MAT.along < 0.2)].all()
+    assert not on[EDGE & (MAT.along > 0.5)].any()
+
+
+def test_mat_storm_runs_down_a_side_and_grounds_at_the_mouse() -> None:
+    effect = make(MatStorm, 16)
+    frame(effect, QUIET_HIT)
+    pixels = run(effect, 0.12, SILENCE)
+    assert pixels[MAT.mouse].min() > 150
+
+
+def test_mat_starfield_shoots_stars_and_waxes_the_moon() -> None:
+    effect = make(MatStarfield, 16)
+    frame(effect, QUIET_HIT)
+    assert run(effect, 0.1, SILENCE)[EDGE].min(axis=1).max() > 100
+    bright = run(make(MatStarfield, 16), 0.5, BASS)[MAT.mouse].sum()
+    assert bright > run(make(MatStarfield, 16), 0.5, SILENCE)[MAT.mouse].sum() * 2
+
+
+def test_mat_note_color_takes_the_color_of_the_note() -> None:
+    pixels = run(make(MatNoteColor, 16), 1.5, FakeAudio(pitch=60))
+    assert int(np.argmax(pixels.sum(axis=0))) == 0
+
+
+def test_mat_drum_kit_kicks_the_bottom_and_the_mouse() -> None:
+    pixels = frame(
+        make(MatDrumKit, 16), FakeAudio(beat=True, lows=0.0, mids=0.0, highs=0.0)
+    )
+    assert lit(pixels[MAT.mouse]).all()
+    assert lit(pixels[EDGE & (HEIGHT < 0.3)]).all()
+    assert not lit(pixels[EDGE & (HEIGHT > 0.5)]).any()
+
+
+@pytest.mark.parametrize("audio, right", [(BASS, True), (TREBLE, False)])
+def test_mat_tug_of_war_pulls_the_knot_to_the_winning_side(
+    audio: FakeAudio, right: bool
+) -> None:
+    effect = make(MatTugOfWar, 16)
+    run(effect, 2, audio)
+    assert (effect.knot > 0.8) if right else (effect.knot < 0.2)
+
+
+def test_mat_battery_charges_from_the_left_tip() -> None:
+    effect = make(MatBattery, 16, charge_rate=1.0)
+    pixels = run(effect, 0.5, LOUD)
+    on = lit(pixels, 50)
+    assert on[EDGE & (MAT.along < 0.4)].all()
+    assert not on[EDGE & (MAT.along > 0.6)].any()
+
+
+def test_mat_binary_counts_the_beats_from_the_left_tip() -> None:
+    effect = plain(make(MatBinary, 16))
+    effect.song.beats = 5.0
+    on = lit(frame(effect))
+    order = np.argsort(np.where(MAT.mouse, np.inf, MAT.along), kind="stable")
+    assert on[order[0]] and on[order[2]]
+    assert not on[order[1]]
+    assert np.count_nonzero(on[EDGE]) == 2
+
+
+def test_mat_history_carries_the_volume_round_the_pad() -> None:
+    effect = plain(make(MatHistory, 16, steps_per_second=10.0))
+    run(effect, 0.3, LOUD)
+    pixels = run(effect, 0.5, SILENCE)
+    assert brightest(pixels, MAT.along, EDGE) > 0.2
+    assert pixels[EDGE & (MAT.along < 0.05)].max() < 10
+
+
+def test_mat_fountain_spouts_up_both_sides_on_the_beat() -> None:
+    effect = make(MatFountain, 16)
+    assert frame(effect, FakeAudio(beat=True))[MAT.mouse].min() > 100
+    assert len(effect._drops) == 2
+    pixels = run(effect, 0.3, SILENCE)
+    left, right = EDGE & (MAT.along < 0.45), EDGE & (MAT.along > 0.55)
+    assert lit(pixels[left], 30).any()
+    assert lit(pixels[right], 30).any()
+
+
+def test_mat_pop_pops_on_the_beat_and_the_mouse_on_hits() -> None:
+    assert lit(frame(make(MatPop, 16), FakeAudio(beat=True))[EDGE]).all()
+    pixels = frame(make(MatPop, 16), FakeAudio(onset=True))
+    assert pixels[MAT.mouse].min() > 200
+    assert pixels[EDGE].max() == 0
+
+
+def test_mat_embers_glow_hotter_with_the_bass() -> None:
+    loud = run(make(MatEmbers, 16), 1, BASS)
+    quiet = run(make(MatEmbers, 16), 1, SILENCE)
+    assert loud.sum() > quiet.sum()
+
+
+def test_mat_tempo_gauge_reads_the_tempo() -> None:
+    def gauge(rate: float) -> int:
+        effect = make(MatTempoGauge, 16)
+        effect.song.rate = rate
+        return int(np.count_nonzero(lit(frame(effect)[EDGE], 60)))
+
+    assert gauge(3.0) > gauge(1.0) + 8
+
+
+def test_mat_neon_flickers_out_on_a_hit() -> None:
+    effect = make(MatNeon, 16)
+    steady = frame(effect, SILENCE).copy()
+    assert lit(steady).all()
+    flickered = frame(effect, QUIET_HIT)
+    assert not lit(flickered).all()
+    assert lit(run(effect, 0.3, SILENCE)).all()
+
+
+def test_mat_spotlight_moves_on_the_beat() -> None:
+    effect = plain(make(MatSpotlight, 16))
+    run(effect, 0.5, LOUD)
+    frame(effect, FakeAudio(beat=True, lows=1.0, mids=1.0, highs=1.0))
+    pixels = run(effect, 1, LOUD)
+    assert brightest(pixels, MAT.along, EDGE) == pytest.approx(effect._aim, abs=0.12)
+
+
+def test_mouse_rainbow_cycles_and_colors_the_pad() -> None:
+    effect = make(MouseRainbow, 16)
+    before = run(effect, 0.1, LOUD)[MAT.mouse].copy()
+    effect.song.beats = 4.0
+    after = frame(effect, LOUD)
+    assert not np.allclose(before, after[MAT.mouse])
+    assert lit(after[EDGE & (HEIGHT < 0.2)], 30).all()
+
+
+def test_mouse_strobe_flashes_the_mouse_on_hits() -> None:
+    pixels = frame(make(MouseStrobe, 16), QUIET_HIT)
+    assert pixels[MAT.mouse].min() > 200
+    assert pixels[EDGE].max() < 50
+
+
+@pytest.mark.parametrize(
+    "audio, red", [(LOUD, True), (FakeAudio(lows=0.05, mids=0.05, highs=0.05), False)]
+)
+def test_mouse_meter_turns_red_when_loud(audio: FakeAudio, red: bool) -> None:
+    mouse = run(make(MouseMeter, 16), 1, audio)[MAT.mouse][0]
+    assert (mouse[0] > mouse[1]) if red else (mouse[1] > mouse[0])

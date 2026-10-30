@@ -11,48 +11,48 @@ Ce fork
 Version personnelle de `LedFx <https://github.com/LedFx/LedFx>`_ 2.2.0 (GPL-3.0, comme l'original).
 Ajouts par rapport à l'original :
 
-- **Catégorie d'effets « Custom »** (63 effets, ``ledfx/effects/``, aides dans
-  ``ledfx/effects/utils/custom.py``) : Section Strobe, Heartbeat, Fireflies, Police Lights,
-  Tug of War, Confetti, Kaleidoscope, Color Jump, Interference, Charge Up, Piano Keys,
-  Drum Pads, Sound Locator, Lightning, Aurora, Candles, Beat Counter, Neon Sign,
-  Vibrating String, Color Organ, Polyrhythm, Phone Paint ; effets de studio et de DJ
-  (Sidechain Pump, Trance Gate, Arpeggiator, Wobble, Tape Stop, Phaser, Bitcrush,
-  Vinyl Scratch, Riser, Stutter, Swell, Filter Sweep, Chorus, Overdrive, Chopper) ;
-  éclairage de scène (Blinders, Stage Wash, Flame Jets, Blacklight, Dance Floor,
-  Lens Flare, Lighthouse, Fiber Optic) ; phénomènes lumineux (Doppler, Jacob's Ladder,
-  Magma, Freeze, Eclipse, God Rays, Oil Slick, Sandstorm, Wagon Wheel) ; graphisme
-  (RGB Split, Palette Cycle, Accordion, Palette Morph, TV Static, Dither, Additive Mix,
-  Afterimage, Synthwave Sun).
-- **Catégorie « Corsair »** (137 effets) pour le matériel Corsair relié par la passerelle
-  LedFx vers iCUE, avec la vraie disposition de chaque LED (``ledfx/effects/utils/corsair_layouts.py``,
-  lue dans iCUE) et une disposition de repli pour tout autre ruban :
+- **Catégorie d'effets « Custom »** (48 effets, ``ledfx/effects/``, aides dans
+  ``ledfx/effects/utils/custom.py``) : Accordion, Additive Mix, Afterimage, Arpeggiator,
+  Aurora, Beat Counter, Blacklight, Chopper, Chorus, Color Jump, Color Organ, Confetti,
+  Dance Floor, Dither, Drum Pads, Eclipse, Fiber Optic, Fireflies, Freeze, Heartbeat,
+  Interference, Jacob's Ladder, Kaleidoscope, Lens Flare, Lighthouse, Lightning, Magma,
+  Overdrive, Palette Cycle, Palette Morph, Phone Paint, Piano Keys, Police Lights,
+  Polyrhythm, Sandstorm, Section Strobe, Sidechain Pump, Sound Locator, Stutter, Swell,
+  Synthwave Sun, TV Static, Tape Stop, Trance Gate, Tug of War, Vinyl Scratch, Wagon
+  Wheel, Wobble.
+- **Catégorie « Corsair »** (149 effets) pour le matériel Corsair relié par la passerelle
+  iCUE, avec la vraie disposition de chaque LED
+  (``ledfx/effects/utils/corsair_layouts.py``, lue dans iCUE) et une disposition de repli
+  pour tout autre ruban. L'interface les range dans un **second menu, « Effets
+  périphériques »**, sous le menu des effets habituels :
 
-  - ventilateurs LL sur Lighting Node Pro : Fan Rotor, Fan Meter, Fan Cascade, Fan Vortex,
-    Fan Pulse, Fan Pinwheel, Fan Fire, Fan Stack, Fan Planets, Fan Chase, Fan Butterfly,
-    Fan Lava, Fan Sparks, Fan Metronome, Fan Spectrum, Fan Relay, Fan Breathe, Fan Strobe,
-    Fan Dice, Fan Bounce, Fan Rain, Fan Aurora, Fan Yin Yang, Fan Siren, Fan Starfield,
-    Fan Timer, Fan Traffic Light, Fan Storm ;
-  - AIO H115i Platinum : Pump Swirl, Pump Gauge, Pump Clock, Pump Radar, Pump Heart,
-    Pump Turbine, Pump Thermometer, Pump Eye, Pump Tempo Dial, Pump Boil, Pump Note Wheel,
-    Pump Split, Pump Compass, Pump Beat Ring, Pump Orbit, Pump Spectrum, Pump Breathe,
-    Pump Beacon, Pump Galaxy, Pump Collide, Pump Mandala, Pump Fireball, Pump Aurora,
-    Pump Drip, Pump Strobe, Pump Loop, Pump Sonar (réglage ``top_led`` : la LED de
-    l'anneau qui est en haut) ;
-  - RAM Vengeance RGB Pro : RAM Meter, RAM Wave, RAM Bar Counter, RAM Fire, RAM Elevators,
-    RAM Center Pulse, RAM Mirror Meter, RAM Scanner, RAM Rising, RAM Sparkle, RAM Blocks,
-    RAM Plasma, RAM Waterfall, RAM Rain, RAM Breathe, RAM Strobe, RAM Snake, RAM Bounce,
-    RAM Lava Lamp, RAM Aurora, RAM Battery, RAM Comets, RAM Pong, RAM Timer, RAM Stairs,
-    RAM Glitch, RAM Fireworks ;
-  - clavier K95 RGB Platinum : Key Ripple, Key Equalizer, Key Rain, Key Fire, Key Wave,
-    Key Spotlight, Key Twinkle, Key Scanner, Key Rows, Key Ghost Typist, Key Plasma, Key Radar,
-    Key Warp, Key Snake, Key Fireworks, Key Aurora, Key Spectrogram, Key Breathe, Key Strobe,
-    Key Lava Lamp, Key Pong, Key Rainbow, Key Storm, Key Comets, Key Split, Key Spiral,
-    Key Checkerboard ;
-  - tapis MM800 et souris M55 : Mat Splash, Mat Meter, Mat Chase, Mat Flow, Mat Converge,
-    Mat Fire, Mat Sparkle, Mat Split, Mat Halfpipe, Mat Beat Counter, Mouse Pulse, Mat Comets,
-    Mat Breathe, Mat Strobe, Mat Rain, Mat Aurora, Mat Spectrum, Mat Lava Lamp, Mat Snake,
-    Mat Rainbow, Mat Pulse Line, Mat Ripples, Mat Glitch, Mouse Mood, Mat Timer,
-    Mat Fireworks, Mat Siren ;
+  - ventilateurs LL sur Lighting Node Pro : Fan Aurora, Fan Bar Counter, Fan Battery, Fan
+    Bounce, Fan Breathe, Fan Butterfly, Fan Cascade, Fan Chase, Fan Clock, Fan Color
+    Wheel, Fan Comets, Fan Dice, Fan Eyes, Fan Fire, Fan Fireworks, Fan Gauges, Fan
+    Glitch, Fan Kaleidoscope, Fan Lava, Fan Meter, Fan Metronome, Fan Note Color, Fan
+    Pinwheel, Fan Planets, Fan Plasma, Fan Pop, Fan Pulse, Fan Rain, Fan Rainbow, Fan
+    Relay, Fan Ripple, Fan Riser, Fan Rotor, Fan Scanner, Fan Siren, Fan Snake, Fan
+    Sparks, Fan Spectrum, Fan Stack, Fan Starfield, Fan Storm, Fan Strobe, Fan Timer, Fan
+    Traffic Light, Fan Turntables, Fan Vortex, Fan Wave, Fan Yin Yang ;
+  - AIO H115i Platinum : Pump Collide, Pump Comets, Pump Split, Pump Storm, Pump Strobe
+    (réglage ``top_led`` : la LED de l'anneau qui est en haut) ;
+  - RAM Vengeance RGB Pro : RAM Bounce, RAM Center Pulse, RAM Drum Kit, RAM Fire, RAM
+    Meter, RAM Mirror Meter, RAM Plasma, RAM Strobe ;
+  - clavier K95 RGB Platinum : Key Aurora, Key Bounce, Key Bouncing Logo, Key Breathe, Key
+    Color Wheel, Key Drum Kit, Key Equalizer, Key Fire, Key Fireflies, Key Fireworks, Key
+    Fountain, Key Glitch, Key Kaleidoscope, Key Lava Lamp, Key Level, Key Marquee, Key
+    Meteors, Key Notes, Key Ocean, Key Plasma, Key Pong, Key Radar, Key Radial EQ, Key
+    Rain, Key Rainbow, Key Raindrops, Key Ripple, Key Rows, Key Scanner, Key Spectrogram,
+    Key Spiral, Key Split, Key Spotlight, Key Storm, Key Strobe, Key Timer, Key Tunnel,
+    Key Twinkle, Key Warp, Key Wave ;
+  - tapis MM800 et souris M55 : Mat Aurora, Mat Battery, Mat Beat Counter, Mat Binary, Mat
+    Breathe, Mat Chase, Mat Comets, Mat Converge, Mat Drum Kit, Mat Embers, Mat Fire, Mat
+    Fireworks, Mat Flow, Mat Fountain, Mat Glitch, Mat Halfpipe, Mat History, Mat Lava
+    Lamp, Mat Level, Mat Meter, Mat Neon, Mat Note Color, Mat Plasma, Mat Pop, Mat Pulse
+    Line, Mat Rain, Mat Rainbow, Mat Ripples, Mat Siren, Mat Snake, Mat Sparkle, Mat
+    Spectrum, Mat Splash, Mat Split, Mat Spotlight, Mat Starfield, Mat Storm, Mat Strobe,
+    Mat Tempo Gauge, Mat Timer, Mat Tug of War, Mat Wave, Mouse Meter, Mouse Mood, Mouse
+    Pulse, Mouse Rainbow, Mouse Strobe ;
   - Rig Wave pour les groupes de plusieurs appareils.
 
 - **Pinceau LED** : le téléphone sert de télécommande et peint sur un ruban en le visant
@@ -63,8 +63,14 @@ Ajouts par rapport à l'original :
 - **Effets cachés** : la catégorie Non-Reactive et quelques autres effets sont retirés du
   sélecteur (``HIDDEN_EFFECTS`` dans ``ledfx/api/schema.py``), sans être supprimés, car
   LedFx s'en sert en interne.
+- **Passerelle iCUE** (``icue_bridge/``) : copie du projet LedFx to iCUE bridge, qui reçoit
+  les flux UDP de LedFx et les applique aux périphériques Corsair par le SDK iCUE (iCUE lancé,
+  SDK activé ; Python 3 avec ``cuesdk`` et ``psutil``, installés au premier lancement). Ses
+  réglages sont dans ``icue_bridge/config.json``, son mode d'emploi dans ``icue_bridge/README.md``.
 - **Lanceur Windows** ``lancer_ledfx.bat`` : config locale ``dev_config\`` (jamais publiée),
-  port 8899, HTTPS du téléphone sur 8900.
+  port 8899, HTTPS du téléphone sur 8900. Il démarre aussi la passerelle iCUE dans sa propre
+  fenêtre (mode ``unique``), sauf si elle tourne déjà ; ``START_BRIDGE=0`` en tête du fichier
+  pour lancer LedFx seul.
 
 What is LedFx?
 ----------------
