@@ -37,7 +37,8 @@ rem Ne change rien s'il est a jour ; le reemet si l'adresse IP du PC a change.
 ".venv\Scripts\python.exe" tools\phone_cert.py "%CONFIG_DIR%"
 if errorlevel 1 echo [ATTENTION] Certificat HTTPS non cree : le telephone n'aura que le mode Glisser.
 set "LAN_IP="
-for /f "usebackq delims=" %%i in (`".venv\Scripts\python.exe" -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('192.168.0.1', 9)); print(s.getsockname()[0])"`) do set "LAN_IP=%%i"
+rem "call" : sinon cmd retire le premier guillemet d'une commande for /f qui commence par un guillemet
+for /f "usebackq delims=" %%i in (`call ".venv\Scripts\python.exe" -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('192.168.0.1', 9)); print(s.getsockname()[0])"`) do set "LAN_IP=%%i"
 
 echo Lancement de LedFx depuis les sources
 echo   Config : %CONFIG_DIR%

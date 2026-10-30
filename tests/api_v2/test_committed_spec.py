@@ -43,9 +43,11 @@ def test_committed_spec_is_current() -> None:
 # 1.11 MB, 36 KB gzipped, with the tools routes): open responses split shared
 # models into -Input/-Output (#2039), and their PATCH copies aren't reused yet
 # (#2025).
-# Raised to 1.5 MB with the 14 local Custom effects (1.30 MB measured): each
+# Raised to 2.2 MB with the 63 local Custom effects (1.91 MB measured): each
 # effect type adds its own config and state components, 12 to 14 KB apiece.
-SPEC_BUDGET_BYTES = 1_500_000
+# Raised to 2.8 MB with the 62 Corsair effects (2.64 MB measured), then to 3.7 MB
+# with 75 more (3.48 MB measured).
+SPEC_BUDGET_BYTES = 3_700_000
 
 
 def test_committed_spec_size_within_budget() -> None:

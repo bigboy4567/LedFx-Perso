@@ -31,7 +31,7 @@ PREFIX = {"effect": "Effect", "device": "Device", "integration": "Integration"}
 BASES = {"effect": Effect, "device": Device, "integration": Integration}
 # The registry sizes in the canonical environment (Linux, Python 3.12, every
 # extra); elsewhere plugins with a missing optional dependency don't load.
-COUNTS = {"effect": 77, "device": 18, "integration": 4}
+COUNTS = {"effect": 263, "device": 18, "integration": 4}
 CANONICAL = os.environ.get("LEDFX_CANONICAL_SPEC") == "1"
 # Device configs require these (no defaults).
 REQUIRED = {"name": "Strip", "ip_address": "192.168.1.50", "group_name": "Group"}

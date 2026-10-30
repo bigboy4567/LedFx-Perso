@@ -11,10 +11,50 @@ Ce fork
 Version personnelle de `LedFx <https://github.com/LedFx/LedFx>`_ 2.2.0 (GPL-3.0, comme l'original).
 Ajouts par rapport à l'original :
 
-- **Catégorie d'effets « Custom »** : Section Strobe, Heartbeat, Fireflies, Police Lights,
+- **Catégorie d'effets « Custom »** (63 effets, ``ledfx/effects/``, aides dans
+  ``ledfx/effects/utils/custom.py``) : Section Strobe, Heartbeat, Fireflies, Police Lights,
   Tug of War, Confetti, Kaleidoscope, Color Jump, Interference, Charge Up, Piano Keys,
-  Drum Pads, Sound Locator et Phone Paint (``ledfx/effects/``, aides dans
-  ``ledfx/effects/utils/custom.py``).
+  Drum Pads, Sound Locator, Lightning, Aurora, Candles, Beat Counter, Neon Sign,
+  Vibrating String, Color Organ, Polyrhythm, Phone Paint ; effets de studio et de DJ
+  (Sidechain Pump, Trance Gate, Arpeggiator, Wobble, Tape Stop, Phaser, Bitcrush,
+  Vinyl Scratch, Riser, Stutter, Swell, Filter Sweep, Chorus, Overdrive, Chopper) ;
+  éclairage de scène (Blinders, Stage Wash, Flame Jets, Blacklight, Dance Floor,
+  Lens Flare, Lighthouse, Fiber Optic) ; phénomènes lumineux (Doppler, Jacob's Ladder,
+  Magma, Freeze, Eclipse, God Rays, Oil Slick, Sandstorm, Wagon Wheel) ; graphisme
+  (RGB Split, Palette Cycle, Accordion, Palette Morph, TV Static, Dither, Additive Mix,
+  Afterimage, Synthwave Sun).
+- **Catégorie « Corsair »** (137 effets) pour le matériel Corsair relié par la passerelle
+  LedFx vers iCUE, avec la vraie disposition de chaque LED (``ledfx/effects/utils/corsair_layouts.py``,
+  lue dans iCUE) et une disposition de repli pour tout autre ruban :
+
+  - ventilateurs LL sur Lighting Node Pro : Fan Rotor, Fan Meter, Fan Cascade, Fan Vortex,
+    Fan Pulse, Fan Pinwheel, Fan Fire, Fan Stack, Fan Planets, Fan Chase, Fan Butterfly,
+    Fan Lava, Fan Sparks, Fan Metronome, Fan Spectrum, Fan Relay, Fan Breathe, Fan Strobe,
+    Fan Dice, Fan Bounce, Fan Rain, Fan Aurora, Fan Yin Yang, Fan Siren, Fan Starfield,
+    Fan Timer, Fan Traffic Light, Fan Storm ;
+  - AIO H115i Platinum : Pump Swirl, Pump Gauge, Pump Clock, Pump Radar, Pump Heart,
+    Pump Turbine, Pump Thermometer, Pump Eye, Pump Tempo Dial, Pump Boil, Pump Note Wheel,
+    Pump Split, Pump Compass, Pump Beat Ring, Pump Orbit, Pump Spectrum, Pump Breathe,
+    Pump Beacon, Pump Galaxy, Pump Collide, Pump Mandala, Pump Fireball, Pump Aurora,
+    Pump Drip, Pump Strobe, Pump Loop, Pump Sonar (réglage ``top_led`` : la LED de
+    l'anneau qui est en haut) ;
+  - RAM Vengeance RGB Pro : RAM Meter, RAM Wave, RAM Bar Counter, RAM Fire, RAM Elevators,
+    RAM Center Pulse, RAM Mirror Meter, RAM Scanner, RAM Rising, RAM Sparkle, RAM Blocks,
+    RAM Plasma, RAM Waterfall, RAM Rain, RAM Breathe, RAM Strobe, RAM Snake, RAM Bounce,
+    RAM Lava Lamp, RAM Aurora, RAM Battery, RAM Comets, RAM Pong, RAM Timer, RAM Stairs,
+    RAM Glitch, RAM Fireworks ;
+  - clavier K95 RGB Platinum : Key Ripple, Key Equalizer, Key Rain, Key Fire, Key Wave,
+    Key Spotlight, Key Twinkle, Key Scanner, Key Rows, Key Ghost Typist, Key Plasma, Key Radar,
+    Key Warp, Key Snake, Key Fireworks, Key Aurora, Key Spectrogram, Key Breathe, Key Strobe,
+    Key Lava Lamp, Key Pong, Key Rainbow, Key Storm, Key Comets, Key Split, Key Spiral,
+    Key Checkerboard ;
+  - tapis MM800 et souris M55 : Mat Splash, Mat Meter, Mat Chase, Mat Flow, Mat Converge,
+    Mat Fire, Mat Sparkle, Mat Split, Mat Halfpipe, Mat Beat Counter, Mouse Pulse, Mat Comets,
+    Mat Breathe, Mat Strobe, Mat Rain, Mat Aurora, Mat Spectrum, Mat Lava Lamp, Mat Snake,
+    Mat Rainbow, Mat Pulse Line, Mat Ripples, Mat Glitch, Mouse Mood, Mat Timer,
+    Mat Fireworks, Mat Siren ;
+  - Rig Wave pour les groupes de plusieurs appareils.
+
 - **Pinceau LED** : le téléphone sert de télécommande et peint sur un ruban en le visant
   (gyroscope recalé par la boussole), en l'inclinant (accéléromètre) ou au doigt. Page
   ``/phone``, canal WebSocket ``/api/phone``, effet ``phone_paint``. Les capteurs exigent

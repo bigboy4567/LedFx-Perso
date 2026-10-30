@@ -19,9 +19,14 @@ TRIGGER_COOLDOWN = 0.08
 AUDIO_STEP = 1 / 60
 # Below this volume a detected pitch is noise, not a note
 NOTE_GATE = 0.05
+# Beats per second assumed until the tempo is known (120 BPM), and the believable range
+DEFAULT_BEAT_RATE = 2.0
+MIN_BEAT_RATE = 0.75
+MAX_BEAT_RATE = 3.5
 
 FloatArray = NDArray[np.float64]
 IntArray = NDArray[np.int_]
+BoolArray = NDArray[np.bool_]
 Trigger = Literal["Beat", "Percussion"]
 
 
@@ -31,6 +36,19 @@ def color_array(value: str) -> FloatArray:
 
 def frame_step(passed: float) -> float:
     return min(passed, MAX_STEP)
+
+
+def hue_colors(hues: FloatArray) -> FloatArray:
+    """Fully saturated colors for hues from 0 to 1, red at 0, one row per hue."""
+    sixths = (np.asarray(hues, dtype=float) % 1)[..., None] * 6
+    k = (np.array((5.0, 3.0, 1.0)) + sixths) % 6
+    return (1 - np.clip(np.minimum(k, 4 - k), 0, 1)) * 255
+
+
+def segment_widths(pixel_count: int, count: int) -> IntArray:
+    """Widths of count near-equal segments covering the strip, at least one pixel each."""
+    count = max(1, min(count, pixel_count))
+    return np.diff(np.linspace(0, pixel_count, count + 1).astype(int))
 
 
 def splat(
@@ -43,6 +61,29 @@ def splat(
         return
     glow = np.exp(-(((x[lo:hi] - center) / radius) ** 2)) * amount
     np.maximum(target[lo:hi], glow, out=target[lo:hi])
+
+
+def paint_glow(
+    pixels: FloatArray,
+    x: FloatArray,
+    center: float,
+    radius: float,
+    color: FloatArray,
+    amount: float = 1.0,
+) -> None:
+    """Max-blend a soft glow of one color into an (n, 3) frame, touching only nearby pixels."""
+    lo = max(0, int(center - 3 * radius))
+    hi = min(len(pixels), int(center + 3 * radius) + 2)
+    if lo >= hi or amount <= 0:
+        return
+    glow = np.exp(-(((x[lo:hi] - center) / radius) ** 2)) * amount
+    np.maximum(pixels[lo:hi], color * glow[:, None], out=pixels[lo:hi])
+
+
+def heat_colors(heat: FloatArray) -> FloatArray:
+    """Black through red, orange and yellow to white as heat goes from 0 to 1."""
+    h = np.clip(np.asarray(heat, dtype=float), 0, 1)[..., None] * 3
+    return np.clip(h - np.array((0.0, 1.0, 2.0)), 0, 1) * 255
 
 
 def volume_of(data: AudioAnalysisSource) -> float:
@@ -74,6 +115,34 @@ class BeatLatch:
         if hit:
             self.last = now
         return hit
+
+
+class TempoTracker:
+    """Follows the song's tempo through the bar oscillator: beats counted so far and their rate.
+
+    The bar oscillator climbs from 0 to 4 over each bar while the tempo is locked,
+    and stands still otherwise, so the count pauses when the music does.
+    """
+
+    def __init__(self) -> None:
+        self.beats = 0.0
+        self.rate = DEFAULT_BEAT_RATE
+        self._bar: float | None = None
+
+    def listen(self, data: AudioAnalysisSource) -> None:
+        bar = float(data.bar_oscillator())
+        if self._bar is not None:
+            step = (bar - self._bar) % 4
+            # A jump of half a beat or more is a resync, not the music moving on
+            if step < 0.5:
+                self.beats += step
+                if step > 0:
+                    self.rate += (step / AUDIO_STEP - self.rate) * 0.05
+        self._bar = bar
+
+    def beat_length(self) -> float:
+        """Seconds per beat, kept within a believable range of tempos."""
+        return 1 / min(max(self.rate, MIN_BEAT_RATE), MAX_BEAT_RATE)
 
 
 def note_color(midi: float) -> FloatArray:

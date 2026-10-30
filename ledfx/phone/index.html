@@ -88,6 +88,8 @@
   label.slider { display: block; margin-top: 12px; font-size: 14px; color: var(--muted); }
   label.slider span { float: right; color: var(--text); }
   input[type=range] { width: 100%; accent-color: var(--accent); height: 30px; }
+  label.check { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 14px; color: var(--muted); }
+  label.check input { width: 22px; height: 22px; margin: 0; accent-color: var(--accent); }
   .paint { margin: 0; height: 30vh; min-height: 170px; border-radius: 22px; border: 0; width: 100%;
     font: inherit; font-size: 24px; font-weight: 800; letter-spacing: .08em; color: #fff;
     background: radial-gradient(circle at 50% 40%, #3a4472, #1d2238); touch-action: none; }
@@ -151,7 +153,8 @@
     <p class="note" id="cal-note">Garde le téléphone immobile, puis touche Valider.</p>
     <button class="btn" id="cal-ok">Valider</button>
     <div class="row" style="margin-top:8px">
-      <button class="btn ghost" id="cal-precise">Calibration précise (5 points)</button>
+      <button class="btn ghost" id="cal-back" hidden>Refaire le point d'avant</button>
+      <button class="btn ghost" id="cal-precise">Calibration ultra précise (20 points)</button>
       <button class="btn ghost" id="cal-cancel">Annuler</button>
     </div>
   </div>
@@ -177,6 +180,12 @@
       <button class="btn ghost" id="nudge-left" aria-label="Décaler vers la gauche">◀</button>
       <span id="nudge-out">Décalage : aucun</span>
       <button class="btn ghost" id="nudge-right" aria-label="Décaler vers la droite">▶</button>
+    </div>
+    <div id="aim-tools">
+      <label class="slider">Anticipation <span id="lead-out"></span>
+        <input type="range" id="lead" min="0" max="250" step="10"></label>
+      <p class="note">Monte-la si la lumière traîne derrière quand tu balaies, baisse-la si elle part devant.</p>
+      <label class="check"><input type="checkbox" id="compass"> Recaler avec la boussole</label>
     </div>
     <p class="note" id="drift"></p>
   </div>
@@ -205,9 +214,10 @@ const EFFECT = "phone_paint";
 // screen hides still shows on LEDs
 const COLORS = ["#ff0000", "#ff8000", "#ffd000", "#00ff00", "#00ffff", "#0040ff",
                 "#8a00ff", "#ff2a9d", "#ffffff"];
-// The compass pulls the gyroscope back over this many seconds: slow enough to
-// smooth the compass's jitter, quick enough that drift never builds up
-const DRIFT_SECONDS = 2;
+// The compass pulls the gyroscope back over this many seconds: slow enough that
+// the compass's jitter, and the pull of nearby speakers or a PC as the phone moves
+// about, barely shift the aim; quick enough that the gyroscope's drift never builds up
+const DRIFT_SECONDS = 5;
 // Pointing past the ends of the strip by more than this hides the cursor
 const OFF_STRIP = 0.04;
 // Resend an unchanged pointer this often, so the strip keeps showing the cursor
@@ -236,6 +246,8 @@ const state = {
   size: store.get("size", 4),
   fade: store.get("fade", 0),
   tiltFlip: store.get("tiltFlip", false),
+  lead: store.get("lead2", 0),          // ms the aim runs ahead of a sweep
+  compass: store.get("compass", true),  // the compass corrects the gyroscope's drift
   down: false,
   slideX: null,
   idle: false,
@@ -277,9 +289,9 @@ async function api(method, path, body) {
 
 // ---------------------------------------------------------------- sensors
 
-let orientation = null;   // {az, el} in degrees, where the phone points
+let orientation = null;   // {v, t}: where the phone points, a unit vector (east, north, up)
 let tilt = null;          // left/right tilt in degrees, from gravity
-const samples = [];       // recent raw orientations, for calibration
+const samples = [];       // recent aims, for calibration
 
 function aimVector(alpha, beta, gamma, style) {
   // The device frame turned into the earth frame (W3C DeviceOrientation, Z-X'-Y'')
@@ -308,13 +320,15 @@ function compassAlpha(event, now) {
   if (absolute && now - absolute.t < 250) return absolute.alpha;
   return null;
 }
-const compassActive = () => yawFix !== null && performance.now() - lastFixAt < 1000;
+const compassActive = () => state.compass && yawFix !== null && performance.now() - lastFixAt < 1000;
 
 function onOrientation(event) {
   if (event.alpha === null || event.beta === null || event.gamma === null) return;
   const now = performance.now();
   let alpha = event.alpha;
-  const reference = compassAlpha(event, now);
+  // With the compass off the correction is frozen, not dropped: the aim keeps the
+  // frame it was calibrated in
+  const reference = state.compass ? compassAlpha(event, now) : null;
   if (reference !== null) {
     if (yawFix === null) yawFix = wrap(reference - alpha);
     else {
@@ -324,12 +338,10 @@ function onOrientation(event) {
     lastFixAt = now;
   }
   if (yawFix !== null) alpha += yawFix;
-  const [x, y, z] = aimVector(alpha, event.beta, event.gamma, state.aimStyle);
-  orientation = {
-    az: Math.atan2(x, y) * 180 / Math.PI,
-    el: Math.asin(Math.max(-1, Math.min(1, z))) * 180 / Math.PI,
-  };
-  samples.push({ t: now, ...orientation });
+  const v = aimVector(alpha, event.beta, event.gamma, state.aimStyle);
+  orientation = { v, t: now };
+  samples.push({ t: now, v });
+  followAim(v, now);
   while (samples.length && now - samples[0].t > 1000) samples.shift();
 }
 
@@ -370,12 +382,37 @@ class OneEuro {
     return this.x;
   }
 }
-// A higher beta than the textbook value: the light must keep up with a sweep
-const smoother = new OneEuro(1.0, 0.08);
+// A higher beta than the textbook value: the light must keep up with a sweep.
+// One filter per angle: across and up.
+const smoothers = [new OneEuro(1.0, 0.08), new OneEuro(1.0, 0.08)];
+
+// The light reaches the strip a little after the hand moves (sensors, wifi, LedFx,
+// the controller), so it can trail behind a sweep. Aiming ahead along the sweep by
+// that delay puts it back under the phone; a still phone is not moved at all.
+class Lead {
+  constructor(seconds = 0.05) { Object.assign(this, { seconds, last: null, t: 0, speed: 0 }); }
+  reset() { this.last = null; this.speed = 0; }
+  update(value, t) {
+    if (this.last !== null) {
+      const dt = Math.max((t - this.t) / 1000, 1e-3);
+      this.speed += (1 - Math.exp(-dt / this.seconds)) * ((value - this.last) / dt - this.speed);
+    }
+    this.last = value;
+    this.t = t;
+    return this.speed;
+  }
+}
+const leads = [new Lead(), new Lead()];
 
 // ---------------------------------------------------------------- calibration
 
 const wrap = (degrees) => ((degrees + 540) % 360) - 180;
+const RAD = Math.PI / 180;
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const unit = (a) => { const length = Math.hypot(...a) || 1; return a.map((c) => c / length); };
+const azimuth = (v) => Math.atan2(v[0], v[1]) / RAD;   // grows turning right
+const elevation = (v) => Math.asin(Math.max(-1, Math.min(1, v[2]))) / RAD;
+const angleBetween = (a, b) => Math.acos(Math.max(-1, Math.min(1, dot(a, b)))) / RAD;
 
 function interp(value, xs, ys) {
   // Piecewise linear, carried on past both ends
@@ -387,8 +424,9 @@ function interp(value, xs, ys) {
 }
 
 let calibration = null;
-// v2: angles follow the compass now, so calibrations made before it do not fit
-const calibrationKey = () => `cal2.${state.strip}.${state.aimStyle}`;
+// v4: the aim follows the path it took through the calibration points; the 3D
+// model of v3 assumed a laser-straight aim that a hand does not give
+const calibrationKey = () => `cal4.${state.strip}.${state.aimStyle}`;
 
 // When the finger last touched a capture button: the tap itself turns the phone a little
 let pressedAt = 0;
@@ -398,39 +436,55 @@ const pressTime = () => {
 };
 
 function heldAim(until = pressTime()) {
-  // The median of the 300 ms before the tap, unwrapped around its first sample
+  // The median of the 300 ms before the tap, axis by axis
   const recent = samples.filter((s) => s.t <= until && until - s.t < 300);
   if (recent.length < 3) return null;
   const median = (list) => { const s = [...list].sort((a, b) => a - b); return s[s.length >> 1]; };
-  const first = recent[0].az;
-  return { az: median(recent.map((s) => first + wrap(s.az - first))), el: median(recent.map((s) => s.el)) };
+  return unit([0, 1, 2].map((axis) => median(recent.map((s) => s.v[axis]))));
 }
 
-const cal = { points: [], positions: [] };
+// The precise calibration catches each point by itself once the phone rests on
+// it: tapping a button turns the phone a little at the worst moment
+const STEADY_MS = 500;        // held this long
+const STEADY_DEGREES = 0.8;   // within this much
+const SETTLE_MS = 700;        // after a point lights, so the hand can get there
+
+const cal = { points: [], order: [], auto: false, shownAt: 0 };
 function startCalibration(count) {
-  cal.positions = count === 5 ? [0, 0.25, 0.5, 0.75, 1] : [0, 0.5, 1];
+  // The ends first, so the spacing of the points between them is known
+  const between = Array.from({ length: count - 2 }, (_, i) => (i + 1) / (count - 1));
+  cal.order = [0, 1, ...between];
   cal.points = [];
+  cal.auto = count > 3;
+  $("cal-back").hidden = !cal.auto;
   show("calibrate");
   showCalibrationStep();
 }
 function showCalibrationStep() {
   const step = cal.points.length;
-  const x = cal.positions[step];
-  $("cal-step").textContent = `${step + 1} / ${cal.positions.length}`;
+  const x = cal.order[step];
+  cal.shownAt = performance.now();
+  $("cal-step").textContent = `${step + 1} / ${cal.order.length}`;
   $("cal-text").textContent = x === 0 ? "Vise le DÉBUT du ruban (le point qui clignote)"
     : x === 1 ? "Vise la FIN du ruban (le point qui clignote)"
     : "Vise le point qui clignote sur le ruban";
-  $("cal-note").textContent = orientation ? "Garde le téléphone immobile, puis touche Valider."
-    : "Aucun capteur d'orientation : utilise le mode Incliner ou Glisser.";
+  $("cal-note").textContent = !orientation ? "Aucun capteur d'orientation : utilise le mode Incliner ou Glisser."
+    : cal.auto ? "Garde le téléphone immobile sur le point : il se valide tout seul."
+    : "Garde le téléphone immobile, puis touche Valider.";
   send({ t: "mark", v: state.strip, x });
 }
-function captureCalibration() {
-  const aim = heldAim();
+function previousPoint() {
+  if (!cal.points.length) return;
+  cal.points.pop();
+  showCalibrationStep();
+}
+function captureCalibration(aim = heldAim()) {
   if (!aim) { $("cal-note").textContent = "Capteurs muets : bouge un peu le téléphone et réessaie."; return; }
-  cal.points.push(aim);
-  if (cal.points.length < cal.positions.length) { showCalibrationStep(); return; }
+  cal.points.push({ v: aim, p: cal.order[cal.points.length] });
+  if (navigator.vibrate) navigator.vibrate(25);
+  if (cal.points.length < cal.order.length) { showCalibrationStep(); return; }
   send({ t: "mark", v: state.strip, x: null });
-  const result = buildCalibration(cal.points, cal.positions);
+  const result = buildCalibration(cal.points);
   if (typeof result === "string") {
     $("cal-note").textContent = result;
     cal.points = [];
@@ -439,38 +493,147 @@ function captureCalibration() {
   }
   calibration = result;
   store.set(calibrationKey(), calibration);
-  smoother.reset();
+  resetAim();
   setMode("aim");
   show("paint");
 }
-function buildCalibration(points, positions) {
-  // Follow azimuth for a level strip and elevation for an upright one
-  const az = [points[0].az];
-  for (let i = 1; i < points.length; i++) az.push(az[i - 1] + wrap(points[i].az - az[i - 1]));
-  const el = points.map((p) => p.el);
-  const spread = (list) => Math.abs(list[list.length - 1] - list[0]);
-  const axis = spread(az) >= spread(el) ? "az" : "el";
-  let angles = axis === "az" ? az : el;
-  let order = [...positions];
-  if (spread(angles) < 6) return "Les points sont trop proches : recule ou vise mieux les extrémités.";
-  const rising = angles[angles.length - 1] > angles[0];
-  for (let i = 1; i < angles.length; i++) {
-    if ((angles[i] > angles[i - 1]) !== rising) return "Les points ne sont pas dans l'ordre : recommence en visant bien chaque point.";
-  }
-  if (!rising) { angles = [...angles].reverse(); order = order.reverse(); }
-  return { axis, angles, positions: order };
+
+function steadyAim(now) {
+  // Where the phone rests, once it has been still for a moment; null while it moves
+  const recent = samples.filter((s) => now - s.t < STEADY_MS);
+  if (recent.length < 5 || now - recent[0].t < STEADY_MS * 0.8) return null;
+  const aim = heldAim(now);
+  return recent.every((s) => angleBetween(s.v, aim) < STEADY_DEGREES) ? aim : null;
+}
+function watchCalibration() {
+  // Run every frame: catches the point the phone has come to rest on
+  if (!cal.auto || !$("calibrate").classList.contains("shown")) return;
+  const now = performance.now();
+  if (now - cal.shownAt < SETTLE_MS || cal.points.length >= cal.order.length) return;
+  const aim = steadyAim(now);
+  if (!aim) return;
+  // Still resting where the last point was caught: the hand has not moved on yet
+  const last = cal.points[cal.points.length - 1];
+  if (last && angleBetween(aim, last.v) < moveNeeded()) return;
+  captureCalibration(aim);
+}
+function moveNeeded() {
+  // A good part of the gap between two points, once both ends are known
+  if (cal.points.length < 2) return 3;
+  const gap = angleBetween(cal.points[0].v, cal.points[1].v) / (cal.order.length - 1);
+  return Math.min(3, Math.max(0.5, gap * 0.4));
 }
 
-function aimedX() {
-  if (!calibration || !orientation) return null;
-  const { axis, angles, positions } = calibration;
-  let angle = orientation[axis];
-  if (axis === "az") {
-    const middle = (angles[0] + angles[angles.length - 1]) / 2;
-    angle = middle + wrap(angle - middle);
+// The aim is followed along the path it took through the calibration points, in
+// angles across (heading) and up (elevation). Nothing is assumed about the room or
+// the way the phone is held, so each point added brings the light closer to the
+// strip everywhere, curves and corners included.
+function angles(model, v) {
+  return [wrap(azimuth(v) - model.heading) * model.level, elevation(v)];
+}
+function buildCalibration(points) {
+  const sorted = [...points].sort((a, b) => a.p - b.p);
+  const start = sorted[0].v, end = sorted[sorted.length - 1].v;
+  if (angleBetween(start, end) < 6) return "Les points sont trop proches : recule ou vise mieux les extrémités.";
+  // Across angles shrink toward the zenith: they are scaled to match the up angles
+  const meanUp = sorted.reduce((sum, s) => sum + elevation(s.v), 0) / sorted.length;
+  const model = { heading: azimuth(start), level: Math.cos(meanUp * RAD) };
+  const path = sorted.map((s) => [...angles(model, s.v), s.p]);
+  // Keep the longest run of points that move steadily from the start to the end:
+  // a point aimed wrong is left out rather than bending the path
+  const [x0, y0] = path[0], [x1, y1] = path[path.length - 1];
+  const along = path.map(([x, y]) => (x - x0) * (x1 - x0) + (y - y0) * (y1 - y0));
+  const best = path.map(() => 1), from = path.map(() => -1);
+  for (let i = 1; i < path.length; i++) {
+    for (let j = 0; j < i; j++) {
+      if (along[j] < along[i] && best[j] + 1 > best[i]) { best[i] = best[j] + 1; from[i] = j; }
+    }
   }
-  angle = smoother.filter(angle, performance.now());
-  return interp(angle, angles, positions);
+  const kept = [];
+  for (let i = path.length - 1; i >= 0; i = from[i]) kept.unshift(i);
+  const dropped = path.length - kept.length;
+  if (kept[0] !== 0 || dropped > Math.max(0, Math.floor((path.length - 2) / 4))) {
+    return "Les points ne sont pas dans l'ordre : recommence en visant bien chaque point.";
+  }
+  model.path = smoothPath(kept.map((i) => path[i]));
+  return model;
+}
+
+// With many points, a smooth curve among them averages out the little miss of each
+// aim; a strip bent round a corner, which no smooth curve follows, keeps its points
+const SMOOTH_FROM = 8;
+const SMOOTH_DEGREE = 4;
+const BENT_DEGREES = 2;
+function smoothPath(path) {
+  if (path.length < SMOOTH_FROM) return path;
+  const positions = path.map((q) => q[2]);
+  const curves = [0, 1].map((axis) => fitPolynomial(positions, path.map((q) => q[axis]), SMOOTH_DEGREE));
+  const miss = Math.sqrt(path.reduce((sum, q) =>
+    sum + (polynomial(curves[0], q[2]) - q[0]) ** 2 + (polynomial(curves[1], q[2]) - q[1]) ** 2, 0) / path.length);
+  if (!(miss < BENT_DEGREES)) return path;
+  return Array.from({ length: 101 }, (_, i) =>
+    [polynomial(curves[0], i / 100), polynomial(curves[1], i / 100), i / 100]);
+}
+function polynomial(coefficients, x) {
+  return coefficients.reduceRight((sum, c) => sum * x + c, 0);
+}
+function fitPolynomial(xs, ys, degree) {
+  // Least squares, by Gaussian elimination of the normal equations
+  const n = degree + 1;
+  const rows = Array.from({ length: n }, (_, i) => {
+    const row = Array.from({ length: n }, (_, j) => xs.reduce((sum, x) => sum + x ** (i + j), 0));
+    row.push(xs.reduce((sum, x, k) => sum + ys[k] * x ** i, 0));
+    return row;
+  });
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(rows[r][col]) > Math.abs(rows[pivot][col])) pivot = r;
+    [rows[col], rows[pivot]] = [rows[pivot], rows[col]];
+    for (let r = 0; r < n; r++) {
+      if (r === col) continue;
+      const factor = rows[r][col] / rows[col][col];
+      for (let c = col; c <= n; c++) rows[r][c] -= factor * rows[col][c];
+    }
+  }
+  return rows.map((row, i) => row[n] / row[i]);
+}
+
+function alongPath(model, x, y) {
+  // The strip position of the nearest point of the path
+  const path = model.path;
+  let best = null, bestDistance = Infinity;
+  for (let i = 0; i < path.length - 1; i++) {
+    const [ax, ay, ap] = path[i], [bx, by, bp] = path[i + 1];
+    const dx = bx - ax, dy = by - ay, length = dx * dx + dy * dy;
+    if (length < 1e-9) continue;
+    let t = ((x - ax) * dx + (y - ay) * dy) / length;
+    // Past the ends the path carries straight on, so aiming beyond reads as off the strip
+    if (i > 0) t = Math.max(t, 0);
+    if (i < path.length - 2) t = Math.min(t, 1);
+    const distance = (ax + t * dx - x) ** 2 + (ay + t * dy - y) ** 2;
+    if (distance < bestDistance) { bestDistance = distance; best = ap + t * (bp - ap); }
+  }
+  return best;
+}
+function pointAt(model, p) {
+  const positions = model.path.map((q) => q[2]);
+  return [0, 1].map((axis) => interp(p, positions, model.path.map((q) => q[axis])));
+}
+
+// The aim in calibrated angles, filtered at every sensor reading: steady when the
+// hand is still, and led along a sweep
+let aimPoint = null;
+function followAim(v, t) {
+  if (!calibration) return;
+  aimPoint = angles(calibration, v).map(
+    (value, i) => smoothers[i].filter(value, t) + leads[i].update(value, t) * state.lead / 1000);
+}
+function resetAim() {
+  for (const filter of [...smoothers, ...leads]) filter.reset();
+  aimPoint = null;
+}
+function aimedX() {
+  return calibration && aimPoint ? alongPath(calibration, ...aimPoint) : null;
 }
 
 // Recentre: aim at the middle again to take out the drift of the gyroscope
@@ -483,34 +646,33 @@ function recenter() {
   send({ t: "mark", v: state.strip, x: null });
   const aim = heldAim();
   if (!aim) return;
-  const { axis, angles, positions } = calibration;
-  const middle = (angles[0] + angles[angles.length - 1]) / 2;
-  let now = aim[axis];
-  if (axis === "az") now = middle + wrap(now - middle);
-  // positions run backwards when the strip was calibrated right to left
-  const pairs = positions.map((p, i) => [p, angles[i]]).sort((a, b) => a[0] - b[0]);
-  const shift = now - interp(0.5, pairs.map((p) => p[0]), pairs.map((p) => p[1]));
-  calibration.angles = angles.map((a) => a + shift);
+  // Drift only ever turns the heading, so the path turns the same way
+  const [x] = angles(calibration, aim);
+  calibration.heading += (x - pointAt(calibration, 0.5)[0]) / calibration.level;
   store.set(calibrationKey(), calibration);
-  smoother.reset();
+  resetAim();
 }
 
 // ---------------------------------------------------------------- painting loop
 
 // Fine correction of the aim, in LEDs toward the end of the strip, kept per strip
-// v2: offsets set to make up for the drift are not wanted once it is gone
-const offsetKey = () => `offset2.${state.strip}`;
+// v4: offsets set to make up for the earlier models are not wanted with this one
+const offsetKey = () => `offset4.${state.strip}`;
 function stripPixels() {
   const strip = state.strips.find((s) => s.id === state.strip);
   return strip ? strip.pixels : 100;
 }
+function across() {
+  // How far right the end of a strip calibrated in Viser lies from its start, in
+  // degrees, when it runs more across than up; null for an upright strip
+  if (state.mode !== "aim" || !calibration) return null;
+  const path = calibration.path, start = path[0], end = path[path.length - 1];
+  const right = end[0] - start[0];
+  return Math.abs(right) >= Math.abs(end[1] - start[1]) ? right : null;
+}
 function leftIsStart() {
-  // A level strip calibrated in Viser tells which of its ends is on the left
-  if (state.mode === "aim" && calibration && calibration.axis === "az") {
-    const p = calibration.positions;
-    return p[0] < p[p.length - 1];
-  }
-  return true;
+  const right = across();
+  return right === null || right > 0;
 }
 function nudge(direction) {
   // direction is -1 for ◀ and +1 for ▶, as the user sees the strip
@@ -520,7 +682,7 @@ function nudge(direction) {
 }
 function showNudge() {
   const leds = store.get(offsetKey(), 0);
-  const side = state.mode === "aim" && calibration && calibration.axis === "az"
+  const side = across() !== null
     ? ((leds > 0) === leftIsStart() ? "la droite" : "la gauche")
     : (leds > 0 ? "la fin" : "le début");
   $("nudge-out").textContent = leds === 0 ? "Décalage : aucun"
@@ -552,6 +714,7 @@ function brushColor(now) {
 let lastKey = "", lastSent = 0;
 function tick(now) {
   requestAnimationFrame(tick);
+  watchCalibration();
   if (!$("paint").classList.contains("shown") || document.hidden || !state.strip) return;
   const x = pointerX();
   const down = state.mode === "slide" ? state.slideX !== null : state.down;
@@ -568,6 +731,7 @@ function tick(now) {
   drawBar(x, message.c, down);
   const drift = state.mode !== "aim" ? ""
     : compassActive() ? "Anti-dérive : boussole active"
+    : !state.compass ? "Boussole coupée : touche Recentrer si la visée glisse"
     : "Anti-dérive : boussole indisponible, touche Recentrer si la visée glisse";
   if ($("drift").textContent !== drift) $("drift").textContent = drift;
   document.documentElement.style.setProperty("--brush", state.brush === "eraser" ? "#666" : message.c);
@@ -621,8 +785,9 @@ function setMode(mode) {
   $("bar-hint").textContent = mode === "slide" ? "Glisse ici" : "";
   $("paint-btn").hidden = mode === "slide";
   $("nudge").hidden = mode === "slide";
+  $("aim-tools").hidden = mode !== "aim";
   showNudge();
-  smoother.reset();
+  resetAim();
 }
 
 function renderStrips() {
@@ -679,6 +844,9 @@ function showSliders() {
   $("size-out").textContent = `${state.size} %`;
   $("fade").value = state.fade;
   $("fade-out").textContent = state.fade === 0 ? "permanente" : `${state.fade} s`;
+  $("lead").value = state.lead;
+  $("lead-out").textContent = state.lead === 0 ? "aucune" : `${state.lead} ms`;
+  $("compass").checked = state.compass;
 }
 
 // ---------------------------------------------------------------- strip control
@@ -763,10 +931,11 @@ function wire() {
   for (const id of ["cal-ok", "recenter"]) {
     $(id).addEventListener("pointerdown", () => { pressedAt = performance.now(); });
   }
-  $("cal-ok").onclick = captureCalibration;
+  $("cal-ok").onclick = () => captureCalibration();
   $("nudge-left").onclick = () => nudge(-1);
   $("nudge-right").onclick = () => nudge(1);
-  $("cal-precise").onclick = () => startCalibration(5);
+  $("cal-precise").onclick = () => startCalibration(20);
+  $("cal-back").onclick = previousPoint;
   $("cal-cancel").onclick = () => {
     send({ t: "mark", v: state.strip, x: null });
     setMode(calibration ? "aim" : "slide");
@@ -802,6 +971,8 @@ function wire() {
   }
 
   $("size").oninput = () => { state.size = Number($("size").value); store.set("size", state.size); showSliders(); };
+  $("lead").oninput = () => { state.lead = Number($("lead").value); store.set("lead2", state.lead); showSliders(); };
+  $("compass").onchange = () => { state.compass = $("compass").checked; store.set("compass", state.compass); };
   $("fade").oninput = () => {
     state.fade = Number($("fade").value);
     store.set("fade", state.fade);
